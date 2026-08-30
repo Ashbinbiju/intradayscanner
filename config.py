@@ -14,7 +14,7 @@ byte-for-byte the Pine default.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 
 # ===========================================================================

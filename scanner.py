@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import os
 import pickle
-from collections import defaultdict
-from datetime import date as _date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -43,7 +42,7 @@ for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY"):
 import config
 from orbfvg import backtest as bt
 from orbfvg import screener
-from orbfvg.strategy import Bar, ORBFVGStrategy
+from orbfvg.strategy import Bar
 
 IST = ZoneInfo("Asia/Kolkata")
 LONDON = ZoneInfo("Europe/London")
@@ -325,6 +324,21 @@ def candle_chart(symbol, ctx, trade, settings):
 st.title("ORB + FVG Scanner")
 
 with st.sidebar:
+    st.header("Mode")
+    mode = st.radio(
+        "Mode", ["Review a day", "Live"], index=0, label_visibility="collapsed",
+        help="Review replays a chosen day once, on demand. Live re-scans by "
+             "itself at every 5-minute close during market hours.")
+    live_mode = mode == "Live"
+    if live_mode:
+        refresh_secs = st.select_slider(
+            "Refresh every", [30, 60, 120, 300], value=60,
+            format_func=lambda v: "%ds" % v if v < 60 else "%dm" % (v // 60))
+        st.caption("Candles are only re-pulled when a 5-minute bar closes, so "
+                   "a faster refresh costs no extra API calls.")
+    else:
+        refresh_secs = 60
+
     st.header("Universe")
     source = st.radio(
         "Symbols from",
@@ -397,7 +411,10 @@ with st.sidebar:
         symbols = [s.strip().upper() for s in typed.replace(",", "\n").split("\n") if s.strip()]
 
     st.header("Date")
-    if source == "Recorded snapshot" and symbols:
+    if live_mode:
+        day = datetime.now(IST).strftime("%Y-%m-%d")
+        st.caption("Live tracks today: %s" % day)
+    elif source == "Recorded snapshot" and symbols:
         day = snap_day
         st.caption("Locked to the snapshot day: %s" % day)
     else:
@@ -427,7 +444,8 @@ with st.sidebar:
     max_per_day = st.number_input("Max trades per day", 1, 20, 3)
     max_concurrent = st.number_input("Max open at once", 1, 20, 3)
 
-    run = st.button("Scan", type="primary", use_container_width=True)
+    run = st.button("Scan now" if live_mode else "Scan",
+                    type="primary", use_container_width=True)
 
 # ---------------------------------------------------------------------------
 #  Live panels

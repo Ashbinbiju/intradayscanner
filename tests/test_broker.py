@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import StrategySettings, TradeSettings
+from config import TradeSettings
 from orbfvg.angel import OrderResult
 from orbfvg.broker import Broker, round_to_tick
 from orbfvg.instruments import Instrument

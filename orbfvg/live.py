@@ -25,11 +25,10 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
-import config
 from .angel import AngelClient
 from .broker import Broker
 from .pine import SessionWindow, na
-from .strategy import Bar, EventType, ORBFVGStrategy
+from .strategy import Bar, ORBFVGStrategy
 
 log = logging.getLogger("orbfvg.live")
 

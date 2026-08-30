@@ -18,7 +18,6 @@ import argparse
 import os
 import pickle
 import sys
-from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
