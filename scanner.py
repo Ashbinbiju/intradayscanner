@@ -69,14 +69,80 @@ def load_cache_file():
         return pickle.load(fh)
 
 
+class SupabaseError(RuntimeError):
+    """Carries a human explanation, not just an HTTP status."""
+
+    def __init__(self, message, hint="", sql=""):
+        super().__init__(message)
+        self.hint = hint
+        self.sql = sql
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def watchlist_symbols(url, key, category, start_t, end_t):
     """symbol -> dates it was listed inside the time window."""
-    from scan_watchlist import fetch_watchlist, qualifying
+    import requests
+
+    from scan_watchlist import qualifying
+
+    base = url.rstrip("/")
+    probe = requests.get(
+        "%s/rest/v1/watchlist_snapshots?select=date&limit=1" % base,
+        headers={"apikey": key, "Authorization": "Bearer " + key}, timeout=30,
+    )
+
+    if probe.status_code in (401, 403):
+        raise SupabaseError(
+            "Supabase rejected the key (HTTP %d)." % probe.status_code,
+            hint=(
+                "The URL resolved, so SUPABASE_URL is fine — it is SUPABASE_KEY "
+                "that is wrong. In the Supabase dashboard go to **Project "
+                "Settings → API Keys** and copy a key that can read this table, "
+                "then paste it into the Streamlit **Secrets** box (App menu → "
+                "Settings → Secrets) and reboot the app.\n\n"
+                "Watch for: a stale key if you rotated it, stray quotes or "
+                "line breaks in the TOML value, or a publishable/anon key on a "
+                "table that has row-level security switched on. If RLS is on, "
+                "an anon key also needs a read policy:"
+            ),
+            sql=(
+                "alter table public.watchlist_snapshots enable row level security;\n\n"
+                "create policy \"anon can read watchlist\"\n"
+                "  on public.watchlist_snapshots\n"
+                "  for select\n"
+                "  to anon\n"
+                "  using (true);"
+            ),
+        )
+    if probe.status_code >= 400:
+        raise SupabaseError("Supabase returned HTTP %d: %s"
+                            % (probe.status_code, probe.text[:200]))
+    if not probe.json():
+        raise SupabaseError(
+            "The key works, but watchlist_snapshots returned no rows.",
+            hint=("Usually row-level security with no SELECT policy for this "
+                  "key's role — the request succeeds and is filtered to nothing. "
+                  "Add a read policy:"),
+            sql=("create policy \"anon can read watchlist\"\n"
+                 "  on public.watchlist_snapshots\n"
+                 "  for select\n  to anon\n  using (true);"),
+        )
+
+    from scan_watchlist import fetch_watchlist
 
     rows = fetch_watchlist(url, key, category)
+    if not rows:
+        raise SupabaseError("No rows found for category %r." % category,
+                            hint="Try a different category in the sidebar.")
     by_symbol = qualifying(rows, start_t, end_t)
     return {k: sorted(v) for k, v in by_symbol.items()}
+
+
+def mask(value):
+    if not value:
+        return "(not set)"
+    return "%s…%s  (%d chars)" % (value[:8], value[-4:], len(value)) \
+        if len(value) > 14 else "(set, %d chars)" % len(value)
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -278,9 +344,19 @@ with st.sidebar:
     if source == "Supabase watchlist":
         url = os.getenv("SUPABASE_URL", "")
         key = os.getenv("SUPABASE_KEY", "")
-        if not url or not key:
-            url = st.text_input("Supabase URL", value=url)
-            key = st.text_input("Supabase key", value=key, type="password")
+
+        with st.expander("Connection", expanded=not (url and key)):
+            st.caption("From Streamlit secrets or the environment. Override "
+                       "here to test a key without redeploying.")
+            st.text("URL  %s" % (url or "(not set)"))
+            st.text("KEY  %s" % mask(key))
+            url = st.text_input("Supabase URL", value=url) or url
+            typed_key = st.text_input(
+                "Supabase key", value="", type="password",
+                placeholder="leave blank to use the secret")
+            if typed_key.strip():
+                key = typed_key.strip()
+
         category = st.selectbox(
             "Category", ["TOP_MOMENTUM", "SECTOR_MOMENTUM", "GAINER", "LOSER"])
         c1, c2 = st.columns(2)
@@ -288,11 +364,22 @@ with st.sidebar:
         end_t = c2.text_input("to", "12:45")
         st.caption("The window the stock must appear in — the run-up to the "
                    "opening range, not the whole day.")
+
         if url and key:
             try:
                 sel_dates = watchlist_symbols(url, key, category, start_t, end_t)
+            except SupabaseError as exc:
+                st.error(str(exc))
+                if exc.hint:
+                    st.info(exc.hint)
+                if exc.sql:
+                    st.code(exc.sql, language="sql")
             except Exception as exc:
                 st.error("Watchlist fetch failed: %s" % exc)
+        else:
+            st.warning("Set SUPABASE_URL and SUPABASE_KEY in the app's Secrets, "
+                       "or paste them above. You can also switch the source to "
+                       "**Type a list** and skip Supabase entirely.")
     else:
         typed = st.text_area(
             "One per line or comma separated",
