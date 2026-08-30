@@ -220,6 +220,36 @@ def to_bars(rows):
     ]
 
 
+def resolve_universe(spec):
+    """Turn a universe *description* into symbols, right now.
+
+    The sidebar records what to select rather than the selection itself, so
+    the live fragment can re-resolve it on every tick. A Streamlit fragment
+    closes over values from the last full script run -- had it captured the
+    symbol list, the app would have kept scanning whatever the screener
+    happened to return when the page loaded, even as the lists turned over
+    completely at the open.
+    """
+    source = spec.get("source")
+    if source == "typed":
+        return list(spec.get("symbols") or []), {}
+    if source == "snapshot":
+        found = screener.symbols_from_history(
+            config.DATA_DIR, spec["day"], spec["buckets"],
+            spec.get("start_t", "00:00"), spec.get("end_t", "23:59"))
+        return found, {}
+    try:
+        data, details = screener_snapshot()
+    except screener.ScreenerError:
+        return [], {}
+    found = screener.symbols(data, spec.get("buckets") or [])
+    floor = spec.get("min_chg") or 0
+    if floor > 0:
+        found = [s for s in found
+                 if abs((details.get(s) or {}).get("priceChangePct") or 0) >= floor]
+    return found, details
+
+
 # ---------------------------------------------------------------------------
 #  Engine
 # ---------------------------------------------------------------------------
@@ -405,8 +435,16 @@ with st.sidebar:
             format_func=lambda v: "%ds" % v if v < 60 else "%dm" % (v // 60))
         st.caption("Candles are only re-pulled when a 5-minute bar closes, so "
                    "a faster refresh costs no extra API calls.")
+        lock_universe = st.checkbox(
+            "Lock the watchlist once the range locks", value=True,
+            help="The screener's lists turn over all day. Re-reading them "
+                 "keeps the watchlist current, but letting it grow through the "
+                 "afternoon inflates the scan and drifts from how the strategy "
+                 "was tested. Locking freezes the set at the moment entries "
+                 "become possible.")
     else:
         refresh_secs = 60
+        lock_universe = True
 
     st.header("Universe")
     source = st.radio(
@@ -414,6 +452,7 @@ with st.sidebar:
         ["Screener (live)", "Recorded snapshot", "Type a list"], index=0)
 
     symbols, details = [], {}
+    spec = {"source": "typed", "symbols": []}
 
     if source == "Screener (live)":
         try:
@@ -438,11 +477,9 @@ with st.sidebar:
                 "Lists", available_buckets, default=default,
                 format_func=lambda b: "%s (%d)" % (
                     screener.LABELS.get(b, b), len(screener.symbols_in(data, b))))
-            symbols = screener.symbols(data, chosen)
             min_chg = st.slider("Min |price change| %", 0.0, 15.0, 0.0, 0.5)
-            if min_chg > 0:
-                symbols = [s for s in symbols
-                           if abs(details.get(s, {}).get("priceChangePct") or 0) >= min_chg]
+            spec = {"source": "live", "buckets": chosen, "min_chg": min_chg}
+            symbols, details = resolve_universe(spec)
             st.caption("%d symbols selected" % len(symbols))
             st.caption("Live snapshot — it reflects **now**, so use it with "
                        "today's date. Each pull is saved for later replay.")
@@ -469,8 +506,9 @@ with st.sidebar:
                 default=[b for b in ("stocksNearDaysHighAnd3DayHigh", "high52Week")
                          if b in pool],
                 format_func=lambda b: screener.LABELS.get(b, b))
-            symbols = screener.symbols_from_history(
-                config.DATA_DIR, snap_day, chosen, start_t, end_t)
+            spec = {"source": "snapshot", "day": snap_day, "buckets": chosen,
+                    "start_t": start_t, "end_t": end_t}
+            symbols, details = resolve_universe(spec)
             st.caption("%d symbols recorded in that window" % len(symbols))
 
     else:
@@ -592,12 +630,47 @@ def live_header(day, symbols, trades, context, settings):
     return phase
 
 
-def render_live(symbols, day, ui, details, max_per_day, max_concurrent):
-    """One live pass: rescan at the current bar and draw everything."""
-    bucket = bar_bucket()
+def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=True):
+    """One live pass: re-resolve the universe, rescan, draw everything."""
     settings = build_settings(ui)
+    phase_key = strategy_phase(settings)[0]
+
+    # Re-resolve every tick so the watchlist tracks the screener as it turns
+    # over through the session -- the whole point of live mode.
+    symbols, details = resolve_universe(spec)
+
+    # Once the range has locked, freeze the set. Symbols joining a momentum
+    # list at 14:00 still have a valid 12:30 range, but letting the universe
+    # grow all afternoon inflates the scan (one candle request per symbol per
+    # bar, at 3/sec) and drifts away from how the strategy was tested.
+    locked = st.session_state.get("locked_universe")
+    if lock_after_range and phase_key in ("armed", "done"):
+        if locked:
+            symbols = locked
+        else:
+            st.session_state["locked_universe"] = symbols
+    elif phase_key in ("waiting", "range"):
+        st.session_state.pop("locked_universe", None)
+
+    previous = st.session_state.get("last_universe")
+    st.session_state["last_universe"] = list(symbols)
+
+    bucket = bar_bucket()
     trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=True)
     phase = live_header(day, symbols, trades, context, settings)
+
+    if previous is not None and set(previous) != set(symbols):
+        added = sorted(set(symbols) - set(previous))
+        gone = sorted(set(previous) - set(symbols))
+        bits = []
+        if added:
+            bits.append("+%d (%s)" % (len(added), ", ".join(added[:5])))
+        if gone:
+            bits.append("-%d (%s)" % (len(gone), ", ".join(gone[:5])))
+        st.caption("Watchlist changed: %s" % "  ".join(bits))
+    if lock_after_range and st.session_state.get("locked_universe"):
+        st.caption("Universe locked at %d symbols for the rest of the session."
+                   % len(symbols))
 
     # New signals since the previous refresh, so nothing is missed while away.
     seen = st.session_state.setdefault("seen_signals", set())
@@ -631,6 +704,7 @@ def render_live(symbols, day, ui, details, max_per_day, max_concurrent):
 
     render_results(trades, context, missing, day, ui, details,
                    max_per_day, max_concurrent)
+    return symbols
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +861,7 @@ if live_mode:
     # and the page does not flash on every tick.
     @st.fragment(run_every=refresh_secs)
     def _live_tick():
-        render_live(symbols, day, ui, details, max_per_day, max_concurrent)
+        render_live(spec, day, ui, max_per_day, max_concurrent, lock_universe)
 
     _live_tick()
     st.stop()
