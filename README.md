@@ -84,6 +84,16 @@ from three sources: the live **intradayscreener.com** API (pick any of its 21
 lists), a **recorded snapshot** of that API from a past day, or a list you type.
 Candles come from the local cache when present, otherwise Angel One.
 
+Two modes. **Review a day** replays a chosen date once, on demand. **Live**
+re-scans by itself at every 5-minute close during market hours and adds a
+header (market state, countdown to the next bar, open-position count) and an
+**Open positions** table showing each live trade marked to the latest close —
+open R, distance to the stop, and which target is next. New signals raise a
+toast so nothing is missed while you are looking elsewhere.
+
+Candles are cached per 5-minute bucket, so refreshing more often than once a
+bar costs nothing: only the first refresh after a bar closes re-pulls data.
+
 Three tabs: **Signals** (every entry in the order it fired, with entry / SL /
 T1-T3 / exit / R, and a ✅ on the ones that fit inside your daily cap),
 **Chart** (candles with the opening range, levels and entry/exit marked), and

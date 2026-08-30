@@ -84,9 +84,44 @@ def screener_snapshot():
     return data, screener.details(data)
 
 
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_candles(symbol, exchange, day_from, day_to):
-    """Cache first, Angel second. Returns (rows, meta) or (None, None)."""
+def bar_bucket(now=None):
+    """Identifier for the current 5-minute slot.
+
+    Passed into fetch_candles purely as part of its cache key, so a live
+    refresh inside the same bar costs nothing and the first refresh after a
+    bar closes pulls fresh candles.
+    """
+    now = now or datetime.now(IST)
+    return "%s %02d:%02d" % (now.strftime("%Y-%m-%d"), now.hour, (now.minute // 5) * 5)
+
+
+def market_state(now=None):
+    """(state, human explanation) for the NSE cash session."""
+    now = now or datetime.now(IST)
+    clock = now.strftime("%H:%M")
+    if now.weekday() >= 5:
+        return "closed", "weekend"
+    if clock < "09:15":
+        return "pre", "opens 09:15"
+    if clock > "15:30":
+        return "closed", "closed at 15:30"
+    return "open", "open until 15:30"
+
+
+def seconds_to_next_bar(now=None):
+    now = now or datetime.now(IST)
+    nxt = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+    nxt = nxt.replace(minute=(nxt.minute // 5) * 5)
+    return max(0, int((nxt - now).total_seconds()))
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_candles(symbol, exchange, day_from, day_to, bucket=""):
+    """Cache first, Angel second. Returns (rows, meta) or (None, None).
+
+    `bucket` is unused in the body -- it exists so a new 5-minute slot is a
+    cache miss and forces a re-fetch.
+    """
     store = load_cache_file()
     if symbol in store["candles"]:
         rows = store["candles"][symbol]
@@ -140,16 +175,18 @@ def build_settings(ui):
     return s
 
 
-def scan(symbols, target_day, ui, exchange="NSE"):
+def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False):
     """Run the engine over each symbol and collect that day's trades."""
     settings = build_settings(ui)
     warm_from = (datetime.strptime(target_day, "%Y-%m-%d") - timedelta(days=14)).strftime("%Y-%m-%d")
 
     trades, context, missing = [], {}, []
-    progress = st.progress(0.0, text="Scanning...")
+    progress = None if quiet else st.progress(0.0, text="Scanning...")
     for n, symbol in enumerate(symbols, 1):
-        progress.progress(n / max(len(symbols), 1), text="Scanning %s (%d/%d)" % (symbol, n, len(symbols)))
-        rows, meta = fetch_candles(symbol, exchange, warm_from, target_day)
+        if progress is not None:
+            progress.progress(n / max(len(symbols), 1),
+                              text="Scanning %s (%d/%d)" % (symbol, n, len(symbols)))
+        rows, meta = fetch_candles(symbol, exchange, warm_from, target_day, bucket)
         if not rows:
             missing.append(symbol)
             continue
@@ -175,7 +212,8 @@ def scan(symbols, target_day, ui, exchange="NSE"):
             if t.entry_time.strftime("%Y-%m-%d") == target_day:
                 t.symbol = symbol
                 trades.append(t)
-    progress.empty()
+    if progress is not None:
+        progress.empty()
     trades.sort(key=lambda t: (t.entry_time, t.symbol))
     return trades, context, missing
 
@@ -391,16 +429,262 @@ with st.sidebar:
 
     run = st.button("Scan", type="primary", use_container_width=True)
 
-# A result is stored as a dict, not a tuple, and stamped with a schema version.
-# Session state survives a redeploy, so a positional tuple from an older build
-# blows up on unpack the moment the shape changes. Anything stale is dropped
-# and the user is simply asked to scan again.
+# ---------------------------------------------------------------------------
+#  Live panels
+# ---------------------------------------------------------------------------
+def open_positions(trades, context):
+    """Signals with no exit yet, marked to the latest bar close."""
+    rows = []
+    for t in trades:
+        if t.exit == t.exit:          # already closed
+            continue
+        bars = (context.get(t.symbol) or {}).get("bars") or []
+        if not bars:
+            continue
+        last = bars[-1].close
+        direction = 1 if t.side == "BUY" else -1
+        risk = abs(t.entry - t.stop)
+        rows.append({
+            "Symbol": t.symbol,
+            "Side": t.side,
+            "In at": t.entry_time.strftime("%H:%M"),
+            "Entry": round(t.entry, 2),
+            "Now": round(last, 2),
+            "Open R": round((last - t.entry) * direction / risk, 2) if risk else None,
+            "%": round((last - t.entry) * direction / t.entry * 100, 2),
+            "Stop": round(t.stop, 2),
+            "To stop %": round(abs(last - t.stop) / last * 100, 2),
+            "T1": round(t.t1, 2),
+            "T2": round(t.t2, 2),
+            "T3": round(t.t3, 2),
+            "Next target": ("T1" if not _reached(t, 1) else
+                            "T2" if not _reached(t, 2) else
+                            "T3" if not _reached(t, 3) else "—"),
+        })
+    return rows
+
+
+def _reached(trade, n):
+    """Has target n already been tagged on this trade?"""
+    return getattr(trade, "targets_hit", 0) >= n
+
+
+def live_header(day, symbols, trades, context):
+    now = datetime.now(IST)
+    state, why = market_state(now)
+    icon = {"open": "🟢", "pre": "🟡", "closed": "🔴"}[state]
+    live_trades = [t for t in trades if t.exit != t.exit]
+
+    c = st.columns(5)
+    c[0].metric("Market", "%s %s" % (icon, state.upper()), why)
+    c[1].metric("Next bar", "%dm %02ds" % divmod(seconds_to_next_bar(now), 60))
+    c[2].metric("Watching", len(symbols))
+    c[3].metric("Signals today", len(trades))
+    c[4].metric("Open now", len(live_trades))
+    st.caption("Refreshed %s IST — candles are re-pulled once per 5-minute close."
+               % now.strftime("%H:%M:%S"))
+    return state
+
+
+def render_live(symbols, day, ui, details, max_per_day, max_concurrent):
+    """One live pass: rescan at the current bar and draw everything."""
+    bucket = bar_bucket()
+    trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=True)
+    state = live_header(day, symbols, trades, context)
+
+    # New signals since the previous refresh, so nothing is missed while away.
+    seen = st.session_state.setdefault("seen_signals", set())
+    keys = {"%s|%s" % (t.symbol, t.entry_time.isoformat()) for t in trades}
+    fresh = keys - seen
+    if fresh and seen:
+        for t in trades:
+            if "%s|%s" % (t.symbol, t.entry_time.isoformat()) in fresh:
+                st.toast("%s %s @ %.2f" % (t.side, t.symbol, t.entry), icon="🔔")
+    st.session_state["seen_signals"] = keys
+
+    live_rows = open_positions(trades, context)
+    st.subheader("Open positions" if live_rows else "No open positions")
+    if live_rows:
+        st.dataframe(
+            pd.DataFrame(live_rows), use_container_width=True, hide_index=True,
+            column_config={
+                "Open R": st.column_config.NumberColumn(format="%+.2f"),
+                "%": st.column_config.NumberColumn(format="%+.2f%%"),
+                "To stop %": st.column_config.NumberColumn(format="%.2f%%"),
+            })
+    elif state == "open":
+        st.caption("Nothing triggered yet. The opening range locks at 12:45 IST "
+                   "and entries run from there.")
+
+    render_results(trades, context, missing, day, ui, details,
+                   max_per_day, max_concurrent)
+
+
+# ---------------------------------------------------------------------------
+#  Rendering
+# ---------------------------------------------------------------------------
+def render_results(trades, context, missing, day, ui, details,
+                   max_per_day, max_concurrent):
+    settings = build_settings(ui)
+    taken, skipped = apply_caps(trades, max_per_day, max_concurrent)
+    closed = [t for t in trades if t.exit == t.exit]
+
+    # -- headline ---------------------------------------------------------------
+    st.subheader("%s — %d signals across %d symbols" % (day, len(trades), len(context)))
+
+    c = st.columns(5)
+    c[0].metric("Signals", len(trades))
+    c[1].metric("Taken (cap %d)" % max_per_day, len(taken))
+    c[2].metric("R, taken", "%+.2f" % sum(t.r_multiple for t in taken if t.r_multiple == t.r_multiple))
+    c[3].metric("R, all signals", "%+.2f" % sum(t.r_multiple for t in closed))
+    wins = sum(1 for t in taken if t.r_multiple > 0.01)
+    c[4].metric("Win rate, taken", "%d/%d" % (wins, len(taken)) if taken else "—")
+
+    if len(trades) > len(taken):
+        st.caption(
+            "The two R figures differ because you cannot hold every signal. "
+            "**R, taken** is the honest one — and which trades land inside the cap "
+            "is partly luck of the draw when several fire on the same bar."
+        )
+
+    tab_signals, tab_chart, tab_none = st.tabs(["Signals", "Chart", "Passed over"])
+
+    # -- signals ----------------------------------------------------------------
+    with tab_signals:
+        if not trades:
+            st.info("No entries triggered on this date with these settings.")
+        else:
+            taken_ids = {id(t) for t in taken}
+            rows = []
+            for n, t in enumerate(trades, 1):
+                rows.append({
+                    "#": n,
+                    "Take": "✅" if id(t) in taken_ids else "—",
+                    "Time": t.entry_time.strftime("%H:%M"),
+                    "Symbol": t.symbol,
+                    "Side": t.side,
+                    "Entry": round(t.entry, 2),
+                    "SL": round(t.stop, 2),
+                    "T1": round(t.t1, 2),
+                    "T2": round(t.t2, 2),
+                    "T3": round(t.t3, 2),
+                    "Exit": round(t.exit, 2) if t.exit == t.exit else None,
+                    "Out": t.exit_time.strftime("%H:%M") if t.exit_time else "open",
+                    "Reason": t.reason,
+                    "R": round(t.r_multiple, 2) if t.r_multiple == t.r_multiple else None,
+                    "%": round(pct_of(t), 2) if t.exit == t.exit else None,
+                    "Day %": _fact(details, t.symbol, "priceChangePct"),
+                    "Vol %": _fact(details, t.symbol, "changeInVolPct"),
+                    "Scans": ", ".join((details.get(t.symbol) or {}).get("scans", [])[:4]),
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df, use_container_width=True, hide_index=True,
+                column_config={
+                    "R": st.column_config.NumberColumn(format="%+.2f"),
+                    "%": st.column_config.NumberColumn(format="%+.2f%%"),
+                },
+            )
+            st.download_button(
+                "Download CSV", df.to_csv(index=False).encode(),
+                "signals_%s.csv" % day, "text/csv")
+
+            if skipped:
+                with st.expander("%d signal(s) skipped by the cap" % len(skipped)):
+                    for t, why in skipped:
+                        st.write("%s **%s** %s — %s  (would have been %+.2fR)"
+                                 % (t.entry_time.strftime("%H:%M"), t.symbol, t.side,
+                                    why, t.r_multiple))
+
+    # -- chart ------------------------------------------------------------------
+    with tab_chart:
+        if not context:
+            st.info("Nothing to chart.")
+        else:
+            traded = sorted({t.symbol for t in trades})
+            options = traded + [s for s in sorted(context) if s not in traded]
+            pick = st.selectbox(
+                "Symbol", options,
+                format_func=lambda s: ("%s  ●" % s) if s in traded else s)
+            ctx = context[pick]
+            trade = next((t for t in trades if t.symbol == pick), None)
+
+            m = st.columns(4)
+            m[0].metric("Day move", "%+.2f%%" % ctx["day_pct"])
+            m[1].metric("Range high", "%.2f" % ctx["orb_high"])
+            m[2].metric("Range low", "%.2f" % ctx["orb_low"])
+            width = ctx["orb_high"] - ctx["orb_low"]
+            mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
+            m[3].metric("Range width", "%.2f (%.2f%%)" % (width, width / mid * 100 if mid else 0))
+
+            st.altair_chart(candle_chart(pick, ctx, trade, settings), use_container_width=True)
+
+            if ctx["events"]:
+                st.caption("Engine events")
+                for e in ctx["events"]:
+                    st.text("%s  %-13s %s" % (e.time.strftime("%H:%M"), e.type.value, e.message))
+
+    # -- no-trades --------------------------------------------------------------
+    with tab_none:
+        traded = {t.symbol for t in trades}
+        quiet = [s for s in context if s not in traded]
+        st.write("**%d symbol(s) scanned, no entry**" % len(quiet))
+        if quiet:
+            rows = []
+            for s in quiet:
+                ctx = context[s]
+                width = ctx["orb_high"] - ctx["orb_low"]
+                mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
+                rows.append({
+                    "Symbol": s,
+                    "Day %": round(ctx["day_pct"], 2),
+                    "Range high": round(ctx["orb_high"], 2),
+                    "Range low": round(ctx["orb_low"], 2),
+                    "Width %": round(width / mid * 100, 2) if mid else None,
+                })
+            st.dataframe(pd.DataFrame(rows).sort_values("Day %", ascending=False),
+                         use_container_width=True, hide_index=True)
+            st.caption("Usually a breakout with no live FVG on the other side of it, "
+                       "or a range too thin to clear the buffer.")
+        if missing:
+            st.warning("No candles for: %s" % ", ".join(missing))
+        for err in st.session_state.get("errors", []):
+            st.error(err)
+
+
+# ---------------------------------------------------------------------------
+#  Entry point
+# ---------------------------------------------------------------------------
 RESULT_SCHEMA = 2
 
+if live_mode:
+    if not symbols:
+        st.warning("No symbols selected — pick some lists in the sidebar.")
+        st.stop()
+
+    _state, _ = market_state()
+    if _state != "open" and not run:
+        live_header(day, symbols, [], {})
+        st.info("The market is closed, so nothing will change. Auto-refresh is "
+                "paused — press **Scan now** to look at today's bars anyway.")
+        st.stop()
+
+    # Only this fragment reruns on the timer, so the sidebar stays responsive
+    # and the page does not flash on every tick.
+    @st.fragment(run_every=refresh_secs)
+    def _live_tick():
+        render_live(symbols, day, ui, details, max_per_day, max_concurrent)
+
+    _live_tick()
+    st.stop()
+
+# -- review mode -------------------------------------------------------------
+# The result is stored as a dict stamped with a schema version, not a tuple.
+# Session state survives a redeploy, so a positional tuple from an older build
+# would blow up on unpack the moment the shape changed. Anything stale is
+# dropped and the user is asked to scan again.
 stored = st.session_state.get("result")
-if isinstance(stored, dict) and stored.get("schema") == RESULT_SCHEMA:
-    pass
-else:
+if not (isinstance(stored, dict) and stored.get("schema") == RESULT_SCHEMA):
     if stored is not None:
         st.session_state.pop("result", None)
     stored = None
@@ -410,10 +694,10 @@ if run:
         st.warning("No symbols selected.")
         st.stop()
     st.session_state["errors"] = []
-    trades, context, missing = scan(symbols, day, ui)
+    _trades, _context, _missing = scan(symbols, day, ui)
     stored = {
-        "schema": RESULT_SCHEMA, "trades": trades, "context": context,
-        "missing": missing, "day": day, "ui": ui, "details": details,
+        "schema": RESULT_SCHEMA, "trades": _trades, "context": _context,
+        "missing": _missing, "day": day, "ui": ui, "details": details,
         "max_per_day": max_per_day, "max_concurrent": max_concurrent,
     }
     st.session_state["result"] = stored
@@ -422,136 +706,6 @@ if stored is None:
     st.info("Choose a universe and a date in the sidebar, then press **Scan**.")
     st.stop()
 
-trades = stored["trades"]
-context = stored["context"]
-missing = stored["missing"]
-day = stored["day"]
-ui = stored["ui"]
-details = stored.get("details") or {}
-max_per_day = stored["max_per_day"]
-max_concurrent = stored["max_concurrent"]
-settings = build_settings(ui)
-taken, skipped = apply_caps(trades, max_per_day, max_concurrent)
-closed = [t for t in trades if t.exit == t.exit]
-
-# -- headline ---------------------------------------------------------------
-st.subheader("%s — %d signals across %d symbols" % (day, len(trades), len(context)))
-
-c = st.columns(5)
-c[0].metric("Signals", len(trades))
-c[1].metric("Taken (cap %d)" % max_per_day, len(taken))
-c[2].metric("R, taken", "%+.2f" % sum(t.r_multiple for t in taken if t.r_multiple == t.r_multiple))
-c[3].metric("R, all signals", "%+.2f" % sum(t.r_multiple for t in closed))
-wins = sum(1 for t in taken if t.r_multiple > 0.01)
-c[4].metric("Win rate, taken", "%d/%d" % (wins, len(taken)) if taken else "—")
-
-if len(trades) > len(taken):
-    st.caption(
-        "The two R figures differ because you cannot hold every signal. "
-        "**R, taken** is the honest one — and which trades land inside the cap "
-        "is partly luck of the draw when several fire on the same bar."
-    )
-
-tab_signals, tab_chart, tab_none = st.tabs(["Signals", "Chart", "Passed over"])
-
-# -- signals ----------------------------------------------------------------
-with tab_signals:
-    if not trades:
-        st.info("No entries triggered on this date with these settings.")
-    else:
-        taken_ids = {id(t) for t in taken}
-        rows = []
-        for n, t in enumerate(trades, 1):
-            rows.append({
-                "#": n,
-                "Take": "✅" if id(t) in taken_ids else "—",
-                "Time": t.entry_time.strftime("%H:%M"),
-                "Symbol": t.symbol,
-                "Side": t.side,
-                "Entry": round(t.entry, 2),
-                "SL": round(t.stop, 2),
-                "T1": round(t.t1, 2),
-                "T2": round(t.t2, 2),
-                "T3": round(t.t3, 2),
-                "Exit": round(t.exit, 2) if t.exit == t.exit else None,
-                "Out": t.exit_time.strftime("%H:%M") if t.exit_time else "open",
-                "Reason": t.reason,
-                "R": round(t.r_multiple, 2) if t.r_multiple == t.r_multiple else None,
-                "%": round(pct_of(t), 2) if t.exit == t.exit else None,
-                "Day %": _fact(details, t.symbol, "priceChangePct"),
-                "Vol %": _fact(details, t.symbol, "changeInVolPct"),
-                "Scans": ", ".join((details.get(t.symbol) or {}).get("scans", [])[:4]),
-            })
-        df = pd.DataFrame(rows)
-        st.dataframe(
-            df, use_container_width=True, hide_index=True,
-            column_config={
-                "R": st.column_config.NumberColumn(format="%+.2f"),
-                "%": st.column_config.NumberColumn(format="%+.2f%%"),
-            },
-        )
-        st.download_button(
-            "Download CSV", df.to_csv(index=False).encode(),
-            "signals_%s.csv" % day, "text/csv")
-
-        if skipped:
-            with st.expander("%d signal(s) skipped by the cap" % len(skipped)):
-                for t, why in skipped:
-                    st.write("%s **%s** %s — %s  (would have been %+.2fR)"
-                             % (t.entry_time.strftime("%H:%M"), t.symbol, t.side,
-                                why, t.r_multiple))
-
-# -- chart ------------------------------------------------------------------
-with tab_chart:
-    if not context:
-        st.info("Nothing to chart.")
-    else:
-        traded = sorted({t.symbol for t in trades})
-        options = traded + [s for s in sorted(context) if s not in traded]
-        pick = st.selectbox(
-            "Symbol", options,
-            format_func=lambda s: ("%s  ●" % s) if s in traded else s)
-        ctx = context[pick]
-        trade = next((t for t in trades if t.symbol == pick), None)
-
-        m = st.columns(4)
-        m[0].metric("Day move", "%+.2f%%" % ctx["day_pct"])
-        m[1].metric("Range high", "%.2f" % ctx["orb_high"])
-        m[2].metric("Range low", "%.2f" % ctx["orb_low"])
-        width = ctx["orb_high"] - ctx["orb_low"]
-        mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
-        m[3].metric("Range width", "%.2f (%.2f%%)" % (width, width / mid * 100 if mid else 0))
-
-        st.altair_chart(candle_chart(pick, ctx, trade, settings), use_container_width=True)
-
-        if ctx["events"]:
-            st.caption("Engine events")
-            for e in ctx["events"]:
-                st.text("%s  %-13s %s" % (e.time.strftime("%H:%M"), e.type.value, e.message))
-
-# -- no-trades --------------------------------------------------------------
-with tab_none:
-    traded = {t.symbol for t in trades}
-    quiet = [s for s in context if s not in traded]
-    st.write("**%d symbol(s) scanned, no entry**" % len(quiet))
-    if quiet:
-        rows = []
-        for s in quiet:
-            ctx = context[s]
-            width = ctx["orb_high"] - ctx["orb_low"]
-            mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
-            rows.append({
-                "Symbol": s,
-                "Day %": round(ctx["day_pct"], 2),
-                "Range high": round(ctx["orb_high"], 2),
-                "Range low": round(ctx["orb_low"], 2),
-                "Width %": round(width / mid * 100, 2) if mid else None,
-            })
-        st.dataframe(pd.DataFrame(rows).sort_values("Day %", ascending=False),
-                     use_container_width=True, hide_index=True)
-        st.caption("Usually a breakout with no live FVG on the other side of it, "
-                   "or a range too thin to clear the buffer.")
-    if missing:
-        st.warning("No candles for: %s" % ", ".join(missing))
-    for err in st.session_state.get("errors", []):
-        st.error(err)
+render_results(stored["trades"], stored["context"], stored["missing"],
+               stored["day"], stored["ui"], stored.get("details") or {},
+               stored["max_per_day"], stored["max_concurrent"])
