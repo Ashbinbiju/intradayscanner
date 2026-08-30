@@ -107,6 +107,75 @@ def market_state(now=None):
     return "open", "open until 15:30"
 
 
+def session_clock(settings, now=None):
+    """When this strategy's day actually happens, in exchange time.
+
+    The NSE bell is not the thing to watch. With the shipped London preset the
+    opening range forms 12:30-12:45 IST and entries run from 12:45 -- so a
+    market-hours clock would report "open" for three hours during which the
+    strategy cannot do anything.
+
+    Derived from orSess/sigSess rather than hardcoded, by walking the day's
+    5-minute slots through the same SessionWindow the engine uses. Switching
+    --preset nse moves these automatically.
+    """
+    from orbfvg.pine import SessionWindow
+
+    now = now or datetime.now(IST)
+    tz = ZoneInfo(settings.tzIn)
+    or_win = SessionWindow.parse(settings.orSess)
+    sig_win = SessionWindow.parse(settings.sigSess)
+
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    or_bars, sig_bars = [], []
+    for i in range(24 * 12):                       # every 5-minute slot of the day
+        slot = midnight + timedelta(minutes=5 * i)
+        local = slot.astimezone(tz)
+        if or_win.contains(local):
+            or_bars.append(slot)
+        if sig_win.contains(local):
+            sig_bars.append(slot)
+
+    out = {"or_start": or_bars[0] if or_bars else None,
+           "or_end": (or_bars[-1] + timedelta(minutes=5)) if or_bars else None,
+           "sig_end": (sig_bars[-1] + timedelta(minutes=5)) if sig_bars else None,
+           "square_off": None}
+    if getattr(settings, "sqOffTime", ""):
+        try:
+            hh, mm = (int(x) for x in settings.sqOffTime.split(":"))
+            out["square_off"] = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except ValueError:
+            pass
+    return out
+
+
+def strategy_phase(settings, now=None):
+    """(key, label, what happens next, seconds until it does)."""
+    now = now or datetime.now(IST)
+    state, why = market_state(now)
+    if state == "closed":
+        return "closed", "CLOSED", why, None
+
+    clock = session_clock(settings, now)
+    or_start, or_end = clock["or_start"], clock["or_end"]
+    finish = clock["square_off"] or clock["sig_end"]
+
+    def until(when):
+        return max(0, int((when - now).total_seconds())) if when else None
+
+    if or_start and now < or_start:
+        return ("waiting", "WAITING",
+                "range forms %s" % or_start.strftime("%H:%M"), until(or_start))
+    if or_start and or_end and now < or_end:
+        return ("range", "RANGE FORMING",
+                "locks %s" % or_end.strftime("%H:%M"), until(or_end))
+    if finish and now < finish:
+        return ("armed", "ENTRIES LIVE",
+                "squares off %s" % finish.strftime("%H:%M"), until(finish))
+    return ("done", "DONE",
+            "squared off %s" % (finish.strftime("%H:%M") if finish else ""), None)
+
+
 def seconds_to_next_bar(now=None):
     now = now or datetime.now(IST)
     nxt = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
@@ -487,28 +556,48 @@ def _reached(trade, n):
     return getattr(trade, "targets_hit", 0) >= n
 
 
-def live_header(day, symbols, trades, context):
+def _hms(seconds):
+    if seconds is None:
+        return "—"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return "%dh %02dm" % (h, m) if h else "%dm %02ds" % (m, s)
+
+
+def live_header(day, symbols, trades, context, settings):
     now = datetime.now(IST)
-    state, why = market_state(now)
-    icon = {"open": "🟢", "pre": "🟡", "closed": "🔴"}[state]
+    phase, label, nxt, secs = strategy_phase(settings, now)
+    icon = {"waiting": "🟡", "range": "🟠", "armed": "🟢",
+            "done": "⚪", "closed": "🔴"}[phase]
     live_trades = [t for t in trades if t.exit != t.exit]
 
     c = st.columns(5)
-    c[0].metric("Market", "%s %s" % (icon, state.upper()), why)
-    c[1].metric("Next bar", "%dm %02ds" % divmod(seconds_to_next_bar(now), 60))
+    c[0].metric("Strategy", "%s %s" % (icon, label), nxt)
+    c[1].metric("Next bar" if phase in ("range", "armed") else "Countdown",
+                _hms(seconds_to_next_bar(now)) if phase in ("range", "armed")
+                else _hms(secs))
     c[2].metric("Watching", len(symbols))
     c[3].metric("Signals today", len(trades))
     c[4].metric("Open now", len(live_trades))
-    st.caption("Refreshed %s IST — candles are re-pulled once per 5-minute close."
-               % now.strftime("%H:%M:%S"))
-    return state
+
+    clock = session_clock(settings, now)
+    plan = "Range %s–%s · entries from %s · square-off %s (%s in %s)" % (
+        clock["or_start"].strftime("%H:%M") if clock["or_start"] else "—",
+        clock["or_end"].strftime("%H:%M") if clock["or_end"] else "—",
+        clock["or_end"].strftime("%H:%M") if clock["or_end"] else "—",
+        (clock["square_off"] or clock["sig_end"]).strftime("%H:%M")
+        if (clock["square_off"] or clock["sig_end"]) else "—",
+        settings.orSess, settings.tzIn)
+    st.caption("%s  ·  refreshed %s IST" % (plan, now.strftime("%H:%M:%S")))
+    return phase
 
 
 def render_live(symbols, day, ui, details, max_per_day, max_concurrent):
     """One live pass: rescan at the current bar and draw everything."""
     bucket = bar_bucket()
+    settings = build_settings(ui)
     trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=True)
-    state = live_header(day, symbols, trades, context)
+    phase = live_header(day, symbols, trades, context, settings)
 
     # New signals since the previous refresh, so nothing is missed while away.
     seen = st.session_state.setdefault("seen_signals", set())
@@ -530,9 +619,15 @@ def render_live(symbols, day, ui, details, max_per_day, max_concurrent):
                 "%": st.column_config.NumberColumn(format="%+.2f%%"),
                 "To stop %": st.column_config.NumberColumn(format="%.2f%%"),
             })
-    elif state == "open":
-        st.caption("Nothing triggered yet. The opening range locks at 12:45 IST "
-                   "and entries run from there.")
+    elif phase == "waiting":
+        st.caption("Nothing can trigger yet — the opening range has not started "
+                   "forming.")
+    elif phase == "range":
+        st.caption("The opening range is still forming. Entries begin once it "
+                   "locks.")
+    elif phase == "armed":
+        st.caption("Range is locked and entries are live; nothing has broken out "
+                   "yet.")
 
     render_results(trades, context, missing, day, ui, details,
                    max_per_day, max_concurrent)
@@ -680,11 +775,12 @@ if live_mode:
         st.warning("No symbols selected — pick some lists in the sidebar.")
         st.stop()
 
-    _state, _ = market_state()
-    if _state != "open" and not run:
-        live_header(day, symbols, [], {})
-        st.info("The market is closed, so nothing will change. Auto-refresh is "
-                "paused — press **Scan now** to look at today's bars anyway.")
+    _settings = build_settings(ui)
+    _phase, _, _next, _ = strategy_phase(_settings)
+    if _phase in ("closed", "done") and not run:
+        live_header(day, symbols, [], {}, _settings)
+        st.info("Nothing more will happen today (%s). Auto-refresh is paused — "
+                "press **Scan now** to review today's bars anyway." % _next)
         st.stop()
 
     # Only this fragment reruns on the timer, so the sidebar stays responsive
