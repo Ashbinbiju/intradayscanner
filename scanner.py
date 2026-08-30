@@ -121,16 +121,21 @@ def to_bars(rows):
 #  Engine
 # ---------------------------------------------------------------------------
 def build_settings(ui):
+    """UI overrides on top of the shipped config.
+
+    Reads defensively: a `ui` dict restored from an older session may be
+    missing keys this build expects, and falling back to the configured
+    default is better than a crash.
+    """
     s, _ = config.load()
-    s.atrMult = ui["atrMult"]
-    s.strongClose = ui["strongClose"]
-    s.useFvg = ui["useFvg"]
-    s.fvgAtrX = ui["fvgAtrX"]
-    s.bufPct = ui["bufPct"]
-    s.useTrail = ui["useTrail"]
-    s.trailMode = ui["trailMode"]
-    s.sqOffTime = ui["sqOff"]
-    s.minRangePct = ui["minRangePct"]
+    ui = ui or {}
+    for ui_key, attr in (("atrMult", "atrMult"), ("strongClose", "strongClose"),
+                         ("useFvg", "useFvg"), ("fvgAtrX", "fvgAtrX"),
+                         ("bufPct", "bufPct"), ("useTrail", "useTrail"),
+                         ("trailMode", "trailMode"), ("sqOff", "sqOffTime"),
+                         ("minRangePct", "minRangePct")):
+        if ui.get(ui_key) is not None:
+            setattr(s, attr, ui[ui_key])
     s.validate()
     return s
 
@@ -386,9 +391,19 @@ with st.sidebar:
 
     run = st.button("Scan", type="primary", use_container_width=True)
 
-if not run and "result" not in st.session_state:
-    st.info("Choose a universe and a date in the sidebar, then press **Scan**.")
-    st.stop()
+# A result is stored as a dict, not a tuple, and stamped with a schema version.
+# Session state survives a redeploy, so a positional tuple from an older build
+# blows up on unpack the moment the shape changes. Anything stale is dropped
+# and the user is simply asked to scan again.
+RESULT_SCHEMA = 2
+
+stored = st.session_state.get("result")
+if isinstance(stored, dict) and stored.get("schema") == RESULT_SCHEMA:
+    pass
+else:
+    if stored is not None:
+        st.session_state.pop("result", None)
+    stored = None
 
 if run:
     if not symbols:
@@ -396,11 +411,25 @@ if run:
         st.stop()
     st.session_state["errors"] = []
     trades, context, missing = scan(symbols, day, ui)
-    st.session_state["result"] = (trades, context, missing, day, ui,
-                                  max_per_day, max_concurrent, details)
+    stored = {
+        "schema": RESULT_SCHEMA, "trades": trades, "context": context,
+        "missing": missing, "day": day, "ui": ui, "details": details,
+        "max_per_day": max_per_day, "max_concurrent": max_concurrent,
+    }
+    st.session_state["result"] = stored
 
-(trades, context, missing, day, ui,
- max_per_day, max_concurrent, details) = st.session_state["result"]
+if stored is None:
+    st.info("Choose a universe and a date in the sidebar, then press **Scan**.")
+    st.stop()
+
+trades = stored["trades"]
+context = stored["context"]
+missing = stored["missing"]
+day = stored["day"]
+ui = stored["ui"]
+details = stored.get("details") or {}
+max_per_day = stored["max_per_day"]
+max_concurrent = stored["max_concurrent"]
 settings = build_settings(ui)
 taken, skipped = apply_caps(trades, max_per_day, max_concurrent)
 closed = [t for t in trades if t.exit == t.exit]
