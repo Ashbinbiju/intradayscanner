@@ -179,6 +179,8 @@ python run.py backtest --symbol SBIN-EQ --days 60 \
 | [orbfvg/live.py](orbfvg/live.py) | Live loop: warm up, then one bar at a time |
 | [orbfvg/backtest.py](orbfvg/backtest.py) | Historical replay and reporting |
 | [orbfvg/screener.py](orbfvg/screener.py) | intradayscreener.com client, bucket parsing, snapshot history |
+| [orbfvg/upstox.py](orbfvg/upstox.py) | Upstox candles + ISIN instrument keys (data only) |
+| [orbfvg/feed.py](orbfvg/feed.py) | One candle source with the other behind it |
 | [config.py](config.py) | Every input, in one place |
 
 The backtester and the live runner drive the **same** `ORBFVGStrategy`, so what
@@ -205,6 +207,39 @@ deliberately preserved:
 - **`pip` is a series.** `"Auto"` re-evaluates `close > 20` every bar.
 
 `tests/test_strategy.py` pins each of these.
+
+---
+
+## Market data, and why there are two sources
+
+Candles come from **Upstox** by default with **Angel One** behind it; either
+can be primary (`DATA_SOURCE`, or the sidebar in the scanner) and the other
+stands in when the first fails or returns nothing.
+
+They agree on price. Compared bar for bar on 28 Aug 2026 across four symbols,
+every shared bar matched on OHLC to the paise and the tick sizes agreed. They
+do **not** agree on coverage:
+
+```
+RELIANCE-EQ   angel last 15:10   upstox last 15:25
+COFORGE-EQ    angel last 15:10   upstox last 15:25
+KPITTECH      angel last 15:10   upstox last 15:25
+```
+
+Angel stops at 15:10 for many symbols. That missing tail is not cosmetic — the
+15:15 square-off needs a bar at 15:15 to fire:
+
+```
+via angel    KPITTECH 12:45 @605.20 -> still OPEN
+via upstox   KPITTECH 12:45 @605.20 -> exit 15:15 @610.80  SESSION_END
+```
+
+Same entry, same strategy; only the data differs. So Upstox is the better
+primary here, not merely a spare.
+
+Orders still go to Angel. The Upstox Analytics token is rejected by the
+trading endpoints unless the request comes from a static IP registered on
+that account, so it cannot place a trade even by accident.
 
 ---
 

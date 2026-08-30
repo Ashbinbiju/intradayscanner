@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from orbfvg import backtest as bt
 from orbfvg.angel import AngelClient
+from orbfvg.feed import MarketData
 from orbfvg.live import LiveRunner
 
 
@@ -159,9 +160,14 @@ def _load_bars(client, strategy, trade, days, date_from, date_to):
         if date_to else datetime.now(tz)
     start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=tz) \
         if date_from else end - timedelta(days=days)
-    inst = client.instrument(trade.symbol, trade.exchange)
+    # Data through the fallback so a rate-limited or flaky Angel does not
+    # sink a backtest; orders still go to Angel.
+    feed = MarketData()
+    inst = feed.instrument(trade.symbol, trade.exchange)
     strategy.mintick = inst.tick_size
-    bars = client.candles(trade.exchange, inst.token, trade.interval, start, end, tz=tz)
+    bars = feed.candles(trade.exchange, trade.symbol, trade.interval, start, end, tz=tz)
+    if bars:
+        print("  candles via %s (%d bars)" % (feed.last_source, len(bars)))
     return inst, bars
 
 

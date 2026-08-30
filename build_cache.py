@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from orbfvg.angel import AngelClient
+from orbfvg.feed import MarketData
 from orbfvg import screener
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -77,21 +77,19 @@ def main() -> int:
     end = datetime.strptime(args.history_to, "%Y-%m-%d").replace(tzinfo=IST)
     print("caching %d symbols, %s -> %s" % (len(symbols), args.history_from, args.history_to))
 
-    client = AngelClient()
-    client.login()
+    client = MarketData()
     store = {"selection": {k: sorted(v) for k, v in by_symbol.items()}, "candles": {}, "meta": {}}
     missing = []
 
     for n, symbol in enumerate(sorted(symbols), 1):
         try:
             inst = client.instrument(symbol, args.exchange)
-        except LookupError:
-            missing.append(symbol)
-            continue
-        try:
-            bars = client.candles(args.exchange, inst.token, "FIVE_MINUTE", start, end, tz=IST)
+            bars = client.candles(args.exchange, symbol, "FIVE_MINUTE", start, end, tz=IST)
         except Exception as exc:
             print("  %s failed: %s" % (symbol, exc))
+            missing.append(symbol)
+            continue
+        if not bars:
             missing.append(symbol)
             continue
         store["candles"][symbol] = [

@@ -32,7 +32,8 @@ import streamlit as st
 # Secrets must reach the environment before config is imported, because config
 # resolves credentials with os.getenv at import time. On Streamlit Cloud they
 # come from .streamlit/secrets.toml; locally, from the shell.
-for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY"):
+for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY",
+             "UPSTOX_TOKEN", "DATA_SOURCE"):
     try:
         if _key in st.secrets and not os.getenv(_key):
             os.environ[_key] = str(st.secrets[_key])
@@ -54,12 +55,11 @@ st.set_page_config(page_title="ORB + FVG Scanner", page_icon="📈", layout="wid
 #  Data
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def get_client():
-    from orbfvg.angel import AngelClient
+def get_feed(prefer):
+    """Candle source with a fallback behind it. Cached: logging in is slow."""
+    from orbfvg.feed import MarketData
 
-    client = AngelClient()
-    client.login()
-    return client
+    return MarketData(prefer=prefer)
 
 
 @st.cache_data(show_spinner=False)
@@ -184,7 +184,7 @@ def seconds_to_next_bar(now=None):
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def fetch_candles(symbol, exchange, day_from, day_to, bucket=""):
+def fetch_candles(symbol, exchange, day_from, day_to, bucket="", prefer="upstox"):
     """Cache first, Angel second. Returns (rows, meta) or (None, None).
 
     `bucket` is unused in the body -- it exists so a new 5-minute slot is a
@@ -198,16 +198,18 @@ def fetch_candles(symbol, exchange, day_from, day_to, bucket=""):
         if keep:
             return keep, meta
     try:
-        client = get_client()
-        inst = client.instrument(symbol, exchange)
-        bars = client.candles(
-            exchange, inst.token, "FIVE_MINUTE",
+        feed = get_feed(prefer)
+        inst = feed.instrument(symbol, exchange)
+        bars = feed.candles(
+            exchange, symbol, "FIVE_MINUTE",
             datetime.strptime(day_from, "%Y-%m-%d").replace(tzinfo=IST),
             datetime.strptime(day_to, "%Y-%m-%d").replace(tzinfo=IST) + timedelta(days=1),
             tz=IST,
         )
     except Exception as exc:
         st.session_state.setdefault("errors", []).append("%s: %s" % (symbol, exc))
+        return None, None
+    if not bars:
         return None, None
     rows = [(b.time.isoformat(), b.open, b.high, b.low, b.close, b.volume) for b in bars]
     return rows, {"tick": inst.tick_size, "lot": inst.lotsize, "token": inst.token}
@@ -273,7 +275,8 @@ def build_settings(ui):
     return s
 
 
-def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False):
+def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
+         prefer="upstox"):
     """Run the engine over each symbol and collect that day's trades."""
     settings = build_settings(ui)
     warm_from = (datetime.strptime(target_day, "%Y-%m-%d") - timedelta(days=14)).strftime("%Y-%m-%d")
@@ -284,7 +287,7 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False):
         if progress is not None:
             progress.progress(n / max(len(symbols), 1),
                               text="Scanning %s (%d/%d)" % (symbol, n, len(symbols)))
-        rows, meta = fetch_candles(symbol, exchange, warm_from, target_day, bucket)
+        rows, meta = fetch_candles(symbol, exchange, warm_from, target_day, bucket, prefer)
         if not rows:
             missing.append(symbol)
             continue
@@ -547,6 +550,14 @@ with st.sidebar:
     ui["sqOff"] = st.text_input("Square off at (IST)", "15:15",
                                 help="Blank disables — matches TradingView")
 
+    st.header("Data")
+    prefer = st.radio(
+        "Candles from", ["Upstox", "Angel One"], index=0, horizontal=True,
+        help="Whichever is picked, the other stands in when it fails. They "
+             "agree on price; Angel's feed stops at 15:10 for many symbols "
+             "while Upstox carries the 15:15-15:25 bars.").lower()
+    prefer = "upstox" if prefer.startswith("upstox") else "angel"
+
     st.header("Position limits")
     max_per_day = st.number_input("Max trades per day", 1, 20, 3)
     max_concurrent = st.number_input("Max open at once", 1, 20, 3)
@@ -630,7 +641,8 @@ def live_header(day, symbols, trades, context, settings):
     return phase
 
 
-def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=True):
+def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=True,
+                prefer="upstox"):
     """One live pass: re-resolve the universe, rescan, draw everything."""
     settings = build_settings(ui)
     phase_key = strategy_phase(settings)[0]
@@ -656,7 +668,8 @@ def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=Tru
     st.session_state["last_universe"] = list(symbols)
 
     bucket = bar_bucket()
-    trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=True)
+    trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=True,
+                                    prefer=prefer)
     phase = live_header(day, symbols, trades, context, settings)
 
     if previous is not None and set(previous) != set(symbols):
@@ -861,7 +874,8 @@ if live_mode:
     # and the page does not flash on every tick.
     @st.fragment(run_every=refresh_secs)
     def _live_tick():
-        render_live(spec, day, ui, max_per_day, max_concurrent, lock_universe)
+        render_live(spec, day, ui, max_per_day, max_concurrent, lock_universe,
+                    prefer)
 
     _live_tick()
     st.stop()
@@ -882,7 +896,7 @@ if run:
         st.warning("No symbols selected.")
         st.stop()
     st.session_state["errors"] = []
-    _trades, _context, _missing = scan(symbols, day, ui)
+    _trades, _context, _missing = scan(symbols, day, ui, prefer=prefer)
     stored = {
         "schema": RESULT_SCHEMA, "trades": _trades, "context": _context,
         "missing": _missing, "day": day, "ui": ui, "details": details,
