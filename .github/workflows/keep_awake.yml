@@ -1,0 +1,81 @@
+name: Keep Streamlit Awake
+
+# Streamlit Community Cloud sleeps an app after roughly 7 days without
+# traffic. Regular requests stop the inactivity timer from expiring.
+#
+# Two honest limits, both worth knowing before trusting this:
+#
+#   1. If the app is PRIVATE (viewer allowlist), an unauthenticated request
+#      never reaches it -- Streamlit answers 303 and redirects to its auth
+#      page. GitHub has no session cookie, so the ping cannot help. The job
+#      reports that instead of failing every six hours.
+#   2. Even on a public app this only PREVENTS sleep. Waking one that has
+#      already slept needs a human to click "Yes, get this app back up!"
+#      in a browser; no request can press that button.
+
+on:
+  schedule:
+    # Every 6 hours: 00:00, 06:00, 12:00, 18:00 UTC
+    #             =  05:30, 11:30, 17:30, 23:30 IST
+    - cron: "0 */6 * * *"
+    # 06:20 UTC = 11:50 IST on weekdays -- warms the app 40 minutes before
+    # the opening range starts forming at 12:30 IST, so the first scan of
+    # the day is not waiting on a cold start.
+    - cron: "20 6 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping the app
+        env:
+          APP: https://iscanner-ashbin.streamlit.app
+        run: |
+          set -uo pipefail
+
+          # Read the FIRST response only. Following redirects on a private app
+          # walks into an auth loop that curl abandons after 50 hops, and the
+          # error output is easy to misread -- `$(curl ... || echo 000)` even
+          # appends to curl's own output, producing nonsense like "303000".
+          # The first set of headers answers the question on its own.
+          headers=$(curl -sS -I --max-time 60 "$APP/" 2>/dev/null) || true
+          code=$(printf '%s' "$headers" | head -1 | awk '{print $2}')
+          location=$(printf '%s' "$headers" | tr -d '\r' \
+                     | grep -i '^location:' | head -1 | cut -d' ' -f2-)
+          [ -n "$code" ] || code="000"
+
+          echo "HTTP ${code}"
+          [ -n "$location" ] && echo "redirects to: ${location}"
+
+          case "$location" in
+            *"/-/auth/"*|*"/-/login"*)
+              echo "::notice::App is PRIVATE, so this ping cannot reach it."
+              echo ""
+              echo "That is the correct setting -- the app carries live trading"
+              echo "credentials and should not be open to anyone with the URL."
+              echo "The trade-off is that anonymous pings cannot keep it awake."
+              echo ""
+              echo "If you open the app yourself during the week, that traffic"
+              echo "already resets the 7-day timer and this workflow is not"
+              echo "needed. To make the ping work you would have to make the"
+              echo "app public, which is not worth it here."
+              exit 0
+              ;;
+          esac
+
+          if [ "$code" = "200" ]; then
+            echo "App is awake."
+            exit 0
+          fi
+
+          echo "::error::App did not respond (HTTP $code)."
+          echo "If it has been idle for about a week it may have gone to sleep,"
+          echo "which needs a browser click to undo: $APP"
+          exit 1
