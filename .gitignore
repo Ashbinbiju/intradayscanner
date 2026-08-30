@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+# Scrip master cache (~35 MB, re-downloaded daily)
+data/
+
+# Run logs, trade journals, backtest exports
+logs/
+
+# Local credential overrides
+.env
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
