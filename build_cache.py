@@ -7,8 +7,8 @@ multi-config sweep across 160 symbols painfully slow if every run re-fetches.
 This pulls each symbol once into data/candles_<from>_<to>.pkl; sweep.py then
 loads that and tests as many configurations as you like at full speed.
 
-    set SUPABASE_URL=... & set SUPABASE_KEY=...
-    python build_cache.py --category TOP_MOMENTUM
+    python build_cache.py --day 2026-08-28 --from-time 12:00 --to-time 12:45
+    python build_cache.py --symbols NEWGEN,COFORGE,TEJASNET
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from orbfvg.angel import AngelClient
-from scan_watchlist import fetch_watchlist, qualifying
+from orbfvg import screener
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -35,7 +35,11 @@ def cache_path(hist_from: str, hist_to: str) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--category", default="TOP_MOMENTUM")
+    p.add_argument("--day", default=None,
+                   help="recorded snapshot day to take the universe from")
+    p.add_argument("--symbols", default="", help="explicit comma-separated list")
+    p.add_argument("--buckets", default=",".join(screener.BULLISH),
+                   help="screener lists to draw from")
     p.add_argument("--from-time", default="12:00")
     p.add_argument("--to-time", default="12:45")
     p.add_argument("--history-from", default="2026-08-01")
@@ -44,14 +48,27 @@ def main() -> int:
     p.add_argument("--extra", default="", help="comma-separated extra symbols")
     args = p.parse_args()
 
-    url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY")
-    if not url or not key:
-        print("Set SUPABASE_URL and SUPABASE_KEY.")
-        return 2
-
-    rows = fetch_watchlist(url, key, args.category)
-    by_symbol = qualifying(rows, args.from_time, args.to_time)
-    symbols = set(by_symbol)
+    buckets = [b.strip() for b in args.buckets.split(",") if b.strip()]
+    by_symbol = {}
+    if args.symbols:
+        symbols = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        by_symbol = {s: [] for s in symbols}
+    elif args.day:
+        found = screener.symbols_from_history(
+            config.DATA_DIR, args.day, buckets, args.from_time, args.to_time)
+        by_symbol = {s: [args.day] for s in found}
+        symbols = set(found)
+        if not symbols:
+            print("No snapshots recorded for %s. Run record_snapshot.py during "
+                  "market hours to build the history." % args.day)
+            return 1
+    else:
+        data = screener.fetch()
+        symbols = set(screener.symbols(data, buckets))
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        by_symbol = {s: [today] for s in symbols}
+        screener.save_snapshot(data, config.DATA_DIR)
+    symbols = set(symbols)
     for s in filter(None, (x.strip().upper() for x in args.extra.split(","))):
         symbols.add(s)
         by_symbol.setdefault(s, set())

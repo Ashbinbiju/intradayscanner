@@ -9,9 +9,13 @@ the live runner use, then shows every entry in the order it fired. The cap
 controls answer the question that matters in practice: if you can only take two
 or three trades, which ones would you actually have been in?
 
-Symbols come either from the Supabase watchlist (a category, filtered to the
-stocks listed during the run-up to the opening range) or from a list you type.
-Candles come from the local cache when present, otherwise from Angel One.
+Symbols come from one of three places: the live intradayscreener.com API (any
+of its 21 lists), a recorded snapshot of that API from a past day, or a list
+you type. Candles come from the local cache when present, otherwise Angel One.
+
+The live source reflects *now*, so pair it with today's date. For a past day
+use a recorded snapshot -- running today's movers over last week's charts is
+hindsight, and it flatters every result.
 """
 
 from __future__ import annotations
@@ -29,8 +33,7 @@ import streamlit as st
 # Secrets must reach the environment before config is imported, because config
 # resolves credentials with os.getenv at import time. On Streamlit Cloud they
 # come from .streamlit/secrets.toml; locally, from the shell.
-for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY",
-             "SUPABASE_URL", "SUPABASE_KEY"):
+for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY"):
     try:
         if _key in st.secrets and not os.getenv(_key):
             os.environ[_key] = str(st.secrets[_key])
@@ -39,6 +42,7 @@ for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY",
 
 import config
 from orbfvg import backtest as bt
+from orbfvg import screener
 from orbfvg.strategy import Bar, ORBFVGStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -69,80 +73,15 @@ def load_cache_file():
         return pickle.load(fh)
 
 
-class SupabaseError(RuntimeError):
-    """Carries a human explanation, not just an HTTP status."""
-
-    def __init__(self, message, hint="", sql=""):
-        super().__init__(message)
-        self.hint = hint
-        self.sql = sql
-
-
-@st.cache_data(show_spinner=False, ttl=300)
-def watchlist_symbols(url, key, category, start_t, end_t):
-    """symbol -> dates it was listed inside the time window."""
-    import requests
-
-    from scan_watchlist import qualifying
-
-    base = url.rstrip("/")
-    probe = requests.get(
-        "%s/rest/v1/watchlist_snapshots?select=date&limit=1" % base,
-        headers={"apikey": key, "Authorization": "Bearer " + key}, timeout=30,
-    )
-
-    if probe.status_code in (401, 403):
-        raise SupabaseError(
-            "Supabase rejected the key (HTTP %d)." % probe.status_code,
-            hint=(
-                "The URL resolved, so SUPABASE_URL is fine — it is SUPABASE_KEY "
-                "that is wrong. In the Supabase dashboard go to **Project "
-                "Settings → API Keys** and copy a key that can read this table, "
-                "then paste it into the Streamlit **Secrets** box (App menu → "
-                "Settings → Secrets) and reboot the app.\n\n"
-                "Watch for: a stale key if you rotated it, stray quotes or "
-                "line breaks in the TOML value, or a publishable/anon key on a "
-                "table that has row-level security switched on. If RLS is on, "
-                "an anon key also needs a read policy:"
-            ),
-            sql=(
-                "alter table public.watchlist_snapshots enable row level security;\n\n"
-                "create policy \"anon can read watchlist\"\n"
-                "  on public.watchlist_snapshots\n"
-                "  for select\n"
-                "  to anon\n"
-                "  using (true);"
-            ),
-        )
-    if probe.status_code >= 400:
-        raise SupabaseError("Supabase returned HTTP %d: %s"
-                            % (probe.status_code, probe.text[:200]))
-    if not probe.json():
-        raise SupabaseError(
-            "The key works, but watchlist_snapshots returned no rows.",
-            hint=("Usually row-level security with no SELECT policy for this "
-                  "key's role — the request succeeds and is filtered to nothing. "
-                  "Add a read policy:"),
-            sql=("create policy \"anon can read watchlist\"\n"
-                 "  on public.watchlist_snapshots\n"
-                 "  for select\n  to anon\n  using (true);"),
-        )
-
-    from scan_watchlist import fetch_watchlist
-
-    rows = fetch_watchlist(url, key, category)
-    if not rows:
-        raise SupabaseError("No rows found for category %r." % category,
-                            hint="Try a different category in the sidebar.")
-    by_symbol = qualifying(rows, start_t, end_t)
-    return {k: sorted(v) for k, v in by_symbol.items()}
-
-
-def mask(value):
-    if not value:
-        return "(not set)"
-    return "%s…%s  (%d chars)" % (value[:8], value[-4:], len(value)) \
-        if len(value) > 14 else "(set, %d chars)" % len(value)
+@st.cache_data(show_spinner=False, ttl=120)
+def screener_snapshot():
+    """One live pull, cached briefly so slider fiddling does not re-fetch."""
+    data = screener.fetch()
+    try:
+        screener.save_snapshot(data, config.DATA_DIR)
+    except OSError:
+        pass  # read-only filesystem on some hosts; not fatal
+    return data, screener.details(data)
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -263,6 +202,12 @@ def pct_of(t):
     return (t.exit - t.entry) * (1 if t.side == "BUY" else -1) / t.entry * 100
 
 
+def _fact(details, symbol, field):
+    """A screener field for this symbol, when the universe came from the API."""
+    value = (details.get(symbol) or {}).get(field)
+    return round(value, 2) if isinstance(value, (int, float)) else None
+
+
 # ---------------------------------------------------------------------------
 #  Chart
 # ---------------------------------------------------------------------------
@@ -338,48 +283,70 @@ st.title("ORB + FVG Scanner")
 
 with st.sidebar:
     st.header("Universe")
-    source = st.radio("Symbols from", ["Supabase watchlist", "Type a list"], index=0)
+    source = st.radio(
+        "Symbols from",
+        ["Screener (live)", "Recorded snapshot", "Type a list"], index=0)
 
-    symbols, sel_dates = [], {}
-    if source == "Supabase watchlist":
-        url = os.getenv("SUPABASE_URL", "")
-        key = os.getenv("SUPABASE_KEY", "")
+    symbols, details = [], {}
 
-        with st.expander("Connection", expanded=not (url and key)):
-            st.caption("From Streamlit secrets or the environment. Override "
-                       "here to test a key without redeploying.")
-            st.text("URL  %s" % (url or "(not set)"))
-            st.text("KEY  %s" % mask(key))
-            url = st.text_input("Supabase URL", value=url) or url
-            typed_key = st.text_input(
-                "Supabase key", value="", type="password",
-                placeholder="leave blank to use the secret")
-            if typed_key.strip():
-                key = typed_key.strip()
+    if source == "Screener (live)":
+        try:
+            data, details = screener_snapshot()
+        except screener.ScreenerError as exc:
+            st.error(str(exc))
+            st.info("The screener API is unreachable. Switch the source to "
+                    "**Type a list** to carry on without it.")
+            data = {}
+        if data:
+            side = st.radio("Direction", ["Bullish", "Bearish", "Both"],
+                            index=0, horizontal=True)
+            pool = (screener.BULLISH if side == "Bullish" else
+                    screener.BEARISH if side == "Bearish" else
+                    screener.BULLISH + screener.BEARISH)
+            available_buckets = [b for b in pool if screener.symbols_in(data, b)]
+            default = [b for b in ("stocksNearDaysHighAnd3DayHigh",
+                                   "stocksNearDaysHighAndYestHigh",
+                                   "high52Week", "volumeGainers")
+                       if b in available_buckets] or available_buckets[:2]
+            chosen = st.multiselect(
+                "Lists", available_buckets, default=default,
+                format_func=lambda b: "%s (%d)" % (
+                    screener.LABELS.get(b, b), len(screener.symbols_in(data, b))))
+            symbols = screener.symbols(data, chosen)
+            min_chg = st.slider("Min |price change| %", 0.0, 15.0, 0.0, 0.5)
+            if min_chg > 0:
+                symbols = [s for s in symbols
+                           if abs(details.get(s, {}).get("priceChangePct") or 0) >= min_chg]
+            st.caption("%d symbols selected" % len(symbols))
+            st.caption("Live snapshot — it reflects **now**, so use it with "
+                       "today's date. Each pull is saved for later replay.")
 
-        category = st.selectbox(
-            "Category", ["TOP_MOMENTUM", "SECTOR_MOMENTUM", "GAINER", "LOSER"])
-        c1, c2 = st.columns(2)
-        start_t = c1.text_input("Listed from", "12:00")
-        end_t = c2.text_input("to", "12:45")
-        st.caption("The window the stock must appear in — the run-up to the "
-                   "opening range, not the whole day.")
-
-        if url and key:
-            try:
-                sel_dates = watchlist_symbols(url, key, category, start_t, end_t)
-            except SupabaseError as exc:
-                st.error(str(exc))
-                if exc.hint:
-                    st.info(exc.hint)
-                if exc.sql:
-                    st.code(exc.sql, language="sql")
-            except Exception as exc:
-                st.error("Watchlist fetch failed: %s" % exc)
+    elif source == "Recorded snapshot":
+        days = screener.list_snapshot_days(config.DATA_DIR)
+        if not days:
+            st.warning("No snapshots recorded yet. Run `python record_snapshot.py` "
+                       "on a schedule during market hours to build the history.")
         else:
-            st.warning("Set SUPABASE_URL and SUPABASE_KEY in the app's Secrets, "
-                       "or paste them above. You can also switch the source to "
-                       "**Type a list** and skip Supabase entirely.")
+            snap_day = st.selectbox("Recorded day", days[::-1], index=0)
+            c1, c2 = st.columns(2)
+            start_t = c1.text_input("Listed from", "12:00")
+            end_t = c2.text_input("to", "12:45")
+            st.caption("The window the stock must have appeared in — the "
+                       "run-up to the opening range, not the whole day.")
+            side = st.radio("Direction", ["Bullish", "Bearish", "Both"],
+                            index=0, horizontal=True)
+            pool = (screener.BULLISH if side == "Bullish" else
+                    screener.BEARISH if side == "Bearish" else
+                    screener.BULLISH + screener.BEARISH)
+            chosen = st.multiselect(
+                "Lists", pool,
+                default=[b for b in ("stocksNearDaysHighAnd3DayHigh", "high52Week")
+                         if b in pool],
+                format_func=lambda b: screener.LABELS.get(b, b))
+            symbols = screener.symbols_from_history(
+                config.DATA_DIR, snap_day, chosen, start_t, end_t)
+            st.caption("%d symbols recorded in that window" % len(symbols))
+
     else:
         typed = st.text_area(
             "One per line or comma separated",
@@ -387,13 +354,12 @@ with st.sidebar:
         symbols = [s.strip().upper() for s in typed.replace(",", "\n").split("\n") if s.strip()]
 
     st.header("Date")
-    available = sorted({d for ds in sel_dates.values() for d in ds}) if sel_dates else []
-    if available:
-        day = st.selectbox("Trading day", available[::-1], index=0)
-        symbols = sorted(s for s, ds in sel_dates.items() if day in ds)
-        st.caption("%d symbols qualified on %s" % (len(symbols), day))
+    if source == "Recorded snapshot" and symbols:
+        day = snap_day
+        st.caption("Locked to the snapshot day: %s" % day)
     else:
-        day = st.date_input("Trading day", _date(2026, 8, 28)).strftime("%Y-%m-%d")
+        default_day = datetime.now(IST).date()
+        day = st.date_input("Trading day", default_day).strftime("%Y-%m-%d")
 
     st.header("Strategy")
     ui = {}
@@ -431,9 +397,10 @@ if run:
     st.session_state["errors"] = []
     trades, context, missing = scan(symbols, day, ui)
     st.session_state["result"] = (trades, context, missing, day, ui,
-                                  max_per_day, max_concurrent)
+                                  max_per_day, max_concurrent, details)
 
-trades, context, missing, day, ui, max_per_day, max_concurrent = st.session_state["result"]
+(trades, context, missing, day, ui,
+ max_per_day, max_concurrent, details) = st.session_state["result"]
 settings = build_settings(ui)
 taken, skipped = apply_caps(trades, max_per_day, max_concurrent)
 closed = [t for t in trades if t.exit == t.exit]
@@ -482,6 +449,9 @@ with tab_signals:
                 "Reason": t.reason,
                 "R": round(t.r_multiple, 2) if t.r_multiple == t.r_multiple else None,
                 "%": round(pct_of(t), 2) if t.exit == t.exit else None,
+                "Day %": _fact(details, t.symbol, "priceChangePct"),
+                "Vol %": _fact(details, t.symbol, "changeInVolPct"),
+                "Scans": ", ".join((details.get(t.symbol) or {}).get("scans", [])[:4]),
             })
         df = pd.DataFrame(rows)
         st.dataframe(

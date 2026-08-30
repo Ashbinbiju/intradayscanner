@@ -80,9 +80,9 @@ streamlit run scanner.py
 ```
 
 A visual view of which stocks actually triggered on a given day. Symbols come
-from the Supabase watchlist (a category, filtered to the stocks listed during
-the run-up to the opening range) or from a list you type; candles come from the
-local cache when present, otherwise Angel One.
+from three sources: the live **intradayscreener.com** API (pick any of its 21
+lists), a **recorded snapshot** of that API from a past day, or a list you type.
+Candles come from the local cache when present, otherwise Angel One.
 
 Three tabs: **Signals** (every entry in the order it fired, with entry / SL /
 T1-T3 / exit / R, and a ✅ on the ones that fit inside your daily cap),
@@ -96,7 +96,20 @@ immediately. The position limits matter most: the app shows R for *all* signals
 and R for *the ones you could actually have taken*, which are rarely the same
 number.
 
-Set `SUPABASE_URL` / `SUPABASE_KEY` in the environment to skip typing them.
+### Why snapshots matter
+
+The screener API reports **now**, with no history. Backtesting needs the
+opposite — what was on the list *at the time*. Running today's movers over last
+week's charts is hindsight, and it flatters every result.
+
+```bash
+python record_snapshot.py --loop 300 --market-hours-only
+```
+
+That writes `data/screener/YYYY-MM-DD/HHMM.json` every five minutes, and the
+scanner's **Recorded snapshot** source reads it back with the same
+"listed between 12:00 and 12:45" filter the analysis used. Until a few days
+have accumulated, use the live source with today's date, or type symbols in.
 
 ### Deploying it
 
@@ -115,12 +128,10 @@ Secrets keep the keys out of the repository. They do not stop someone who has
 the URL from *using* the app, and the app carries credentials for a live
 trading account. The viewer allowlist is what closes that.
 
-Two practical notes: `data/` is git-ignored, so a cloud deploy has no candle
+One practical note: `data/` is git-ignored, so a cloud deploy has no candle
 cache and fetches everything from Angel on demand — the first scan of a day is
 slow because of the 3 requests/second limit and the ~35 MB scrip master
-download. And the Supabase key only ever runs `SELECT` on
-`watchlist_snapshots`, so use a read-only **anon** key there, not an
-`sb_secret_` service-role key.
+download. The screener API itself needs no credentials.
 
 ---
 
@@ -157,6 +168,7 @@ python run.py backtest --symbol SBIN-EQ --days 60 \
 | [orbfvg/broker.py](orbfvg/broker.py) | Events → orders. Sizing, protective stop, journal |
 | [orbfvg/live.py](orbfvg/live.py) | Live loop: warm up, then one bar at a time |
 | [orbfvg/backtest.py](orbfvg/backtest.py) | Historical replay and reporting |
+| [orbfvg/screener.py](orbfvg/screener.py) | intradayscreener.com client, bucket parsing, snapshot history |
 | [config.py](config.py) | Every input, in one place |
 
 The backtester and the live runner drive the **same** `ORBFVGStrategy`, so what

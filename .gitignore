@@ -12,3 +12,6 @@ logs/
 
 # Streamlit secrets (never commit)
 .streamlit/secrets.toml
+
+# Recorded screener snapshots are data, not code
+data/screener/
