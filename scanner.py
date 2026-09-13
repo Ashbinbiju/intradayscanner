@@ -43,6 +43,7 @@ for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY",
 import config
 from orbfvg import backtest as bt
 from orbfvg import screener
+from orbfvg import universe as U
 from orbfvg.strategy import Bar
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -70,6 +71,25 @@ def load_cache_file():
         return {"candles": {}, "meta": {}, "selection": {}}
     with open(os.path.join(config.DATA_DIR, files[-1]), "rb") as fh:
         return pickle.load(fh)
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def own_shortlist(day, cutoff, top_n, min_rel_volume, min_move, pool_limit,
+                  min_turnover):
+    """Our own selection. Cached hard -- it scans hundreds of symbols."""
+    stats, built_at = U.load_daily()
+    if not stats:
+        return [], {}, None
+    pool = U.eligible(stats, U.Filters(min_turnover_cr=min_turnover))
+    if pool_limit:
+        pool = pool[:pool_limit]
+    picks = U.shortlist(pool, day, cutoff=cutoff, top_n=top_n,
+                        min_rel_volume=min_rel_volume, min_move_pct=min_move)
+    facts = {c.symbol: {"priceChangePct": c.move_pct,
+                        "changeInVolPct": (c.rel_volume - 1) * 100.0,
+                        "scans": [c.direction, "relvol %.1fx" % c.rel_volume],
+                        "buckets": ["own"]} for c in picks}
+    return [c.symbol for c in picks], facts, built_at
 
 
 @st.cache_data(show_spinner=False, ttl=120)
@@ -235,6 +255,11 @@ def resolve_universe(spec):
     source = spec.get("source")
     if source == "typed":
         return list(spec.get("symbols") or []), {}
+    if source == "own":
+        symbols, facts, _ = own_shortlist(
+            spec["day"], spec["cutoff"], spec["top_n"], spec["min_rel_volume"],
+            spec["min_move"], spec["pool_limit"], spec["min_turnover"])
+        return symbols, facts
     if source == "snapshot":
         found = screener.symbols_from_history(
             config.DATA_DIR, spec["day"], spec["buckets"],
@@ -452,12 +477,45 @@ with st.sidebar:
     st.header("Universe")
     source = st.radio(
         "Symbols from",
-        ["Screener (live)", "Recorded snapshot", "Type a list"], index=0)
+        ["Our screener", "Screener (live)", "Recorded snapshot", "Type a list"],
+        index=0,
+        help="Our screener needs no third-party API -- it ranks the NSE cash "
+             "list from candles we already pull.")
 
     symbols, details = [], {}
     spec = {"source": "typed", "symbols": []}
 
-    if source == "Screener (live)":
+    if source == "Our screener":
+        stats, built_at = U.load_daily()
+        if not stats:
+            st.warning("No universe built yet. Run `python build_universe.py "
+                       "daily` — about two minutes for the whole NSE cash list.")
+        else:
+            st.caption("Universe built %s — %d symbols, %d eligible."
+                       % ((built_at or "?")[:10], len(stats), len(U.eligible(stats))))
+            own_day = st.text_input("Day", datetime.now(IST).strftime("%Y-%m-%d"),
+                                    key="own_day")
+            c1, c2 = st.columns(2)
+            own_cutoff = c1.text_input("Rank as of", "12:25", key="own_cut")
+            own_top = c2.number_input("Top N", 5, 100, 20, key="own_top")
+            own_turnover = st.slider("Min turnover (cr/day)", 1.0, 100.0, 5.0, 1.0)
+            own_relvol = st.slider("Min relative volume", 0.5, 5.0, 1.0, 0.1)
+            own_move = st.slider("Min |move| % by cut-off", 0.0, 10.0, 1.0, 0.5)
+            own_pool = st.number_input("Scan at most", 50, 2000, 400, step=50,
+                                       help="Most liquid first. Each symbol is "
+                                            "one request, so this sets the wait.")
+            spec = {"source": "own", "day": own_day, "cutoff": own_cutoff,
+                    "top_n": int(own_top), "min_rel_volume": own_relvol,
+                    "min_move": own_move, "pool_limit": int(own_pool),
+                    "min_turnover": own_turnover}
+            if st.button("Build shortlist", use_container_width=True):
+                own_shortlist.clear()
+            with st.spinner("Ranking..."):
+                symbols, details = resolve_universe(spec)
+            st.caption("%d candidates, ranked using only bars before %s."
+                       % (len(symbols), own_cutoff))
+
+    elif source == "Screener (live)":
         try:
             data, details = screener_snapshot()
         except screener.ScreenerError as exc:

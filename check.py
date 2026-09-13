@@ -15,10 +15,12 @@ import sys
 
 FILES = [
     "scanner.py", "config.py", "run.py", "sweep.py", "portfolio.py",
-    "build_cache.py", "record_snapshot.py",
+    "build_cache.py", "record_snapshot.py", "build_universe.py",
+    "validate_universe.py",
     "orbfvg/pine.py", "orbfvg/strategy.py", "orbfvg/angel.py",
     "orbfvg/broker.py", "orbfvg/backtest.py", "orbfvg/live.py",
-    "orbfvg/instruments.py", "orbfvg/screener.py",
+    "orbfvg/instruments.py", "orbfvg/screener.py", "orbfvg/upstox.py",
+    "orbfvg/feed.py", "orbfvg/universe.py",
     "tests/test_strategy.py", "tests/test_broker.py",
 ]
 

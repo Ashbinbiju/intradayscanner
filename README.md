@@ -181,6 +181,7 @@ python run.py backtest --symbol SBIN-EQ --days 60 \
 | [orbfvg/screener.py](orbfvg/screener.py) | intradayscreener.com client, bucket parsing, snapshot history |
 | [orbfvg/upstox.py](orbfvg/upstox.py) | Upstox candles + ISIN instrument keys (data only) |
 | [orbfvg/feed.py](orbfvg/feed.py) | One candle source with the other behind it |
+| [orbfvg/universe.py](orbfvg/universe.py) | Our own screener: daily filters, intraday ranking |
 | [config.py](config.py) | Every input, in one place |
 
 The backtester and the live runner drive the **same** `ORBFVGStrategy`, so what
@@ -207,6 +208,57 @@ deliberately preserved:
 - **`pip` is a series.** `"Auto"` re-evaluates `close > 20` every bar.
 
 `tests/test_strategy.py` pins each of these.
+
+---
+
+## Our own stock selection
+
+`build_universe.py` replaces the third-party screener with something computed
+from candles we already pull. No API key, no outage to inherit.
+
+```bash
+python build_universe.py daily                     # pre-market, ~2 min
+python build_universe.py shortlist --cutoff 12:25  # before the range forms
+```
+
+Three stages, cheapest first:
+
+1. **Daily** — one request buys a year of daily bars, so the whole NSE cash
+   list (~2,650 names) costs about two minutes. Filters on liquidity, price
+   and daily volatility: slow-moving facts that do not need re-checking
+   intraday. **2,468 → 930 eligible.** `--as-of` rebuilds the universe as it
+   looked on a past date, so a backtest is not selecting on the future.
+2. **Intraday** — ranks the survivors on relative volume, distance moved, and
+   where price sits in the day's range. Only bars closing **before** the
+   cut-off are read, so a shortlist for a past day contains nothing that was
+   unavailable at the time.
+3. **Range** — the engine's own `minRangePct`, applied at 12:45.
+
+### Is it any good? Measured, not asserted
+
+Both selections over the same 12 sessions, same engine, same position limits
+(median of 101 same-bar orderings):
+
+| | trades | total R | total % | win |
+|---|---|---|---|---|
+| **Third party** every signal | 112 | +8.60 | +17.64 | 47.3% |
+| **Ours** every signal | 131 | −2.24 | −4.15 | 45.4% |
+| **Third party** cap 2/day | 24 | +2.15 | +4.28 | 52.2% |
+| **Ours** cap 2/day | 24 | +0.94 | −0.96 | 41.7% |
+| **Third party** cap 3/day | 36 | +1.95 | +3.74 | 48.6% |
+| **Ours** cap 3/day | 36 | **+4.54** | **+6.72** | 52.8% |
+
+Read that honestly: the third party wins on every signal and at cap 2, ours
+wins at cap 3. A genuine edge would not flip with the cap. **They are
+comparable, and 12 sessions cannot separate them.**
+
+What the comparison does show is more interesting than which list wins. The
+two overlap on only 3–8 of 20 names a day, yet produce similar results — so
+for this strategy the edge is not in the stock selection. The engine's own
+gates (range width, the FVG, the stop) are doing the work, and the screener's
+job is mainly to bound how many symbols get scanned.
+
+So: build our own for independence, not for alpha.
 
 ---
 
