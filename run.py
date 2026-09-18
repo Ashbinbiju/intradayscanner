@@ -172,6 +172,8 @@ def _load_bars(client, strategy, trade, days, date_from, date_to):
 
 
 def cmd_backtest(args) -> int:
+    if getattr(args, "strategy", "orb") == "breakdown":
+        return cmd_backtest_breakdown(args)
     strategy, trade = build_settings(args)
     client = AngelClient()
     client.login()
@@ -189,6 +191,51 @@ def cmd_backtest(args) -> int:
     out = args.out or os.path.join(
         config.LOG_DIR, "backtest_%s_%s.csv" % (inst.symbol, datetime.now().strftime("%Y%m%d_%H%M%S"))
     )
+    bt.export_trades(result, out)
+    print("\n  Trades written to %s\n" % out)
+    return 0
+
+
+def cmd_backtest_breakdown(args) -> int:
+    """Trend -> consolidation -> breakdown -> retest -> short."""
+    from orbfvg.breakdown import BreakdownRetestStrategy
+
+    settings = config.BreakdownSettings()
+    for pair in getattr(args, "set", None) or []:
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if not hasattr(settings, key):
+            raise SystemExit("Unknown setting %r. Valid names: %s"
+                             % (key, ", ".join(sorted(vars(settings)))))
+        setattr(settings, key, coerce(getattr(settings, key), value))
+    settings.validate()
+
+    _, trade = build_settings(args)
+    tz = ZoneInfo(settings.tzIn)
+    end = datetime.now(tz)
+    start = end - timedelta(days=args.days)
+    feed = MarketData()
+    inst = feed.instrument(trade.symbol, trade.exchange)
+    bars = feed.candles(trade.exchange, trade.symbol, trade.interval, start, end, tz=tz)
+    if not bars:
+        print("No candles returned for that window.")
+        return 1
+    print("  candles via %s (%d bars)" % (feed.last_source, len(bars)))
+
+    result = bt.run(bars, settings, engine=BreakdownRetestStrategy)
+    print("")
+    print(bt.format_simple_report(
+        result, inst.symbol, "Breakdown + retest short",
+        ["Trend        >= %.1f%% over %d bars" % (settings.trendPct, settings.trendBars),
+         "Range        %d-%d bars, <= %.2f%% wide"
+         % (settings.consolMinBars, settings.consolMaxBars, settings.consolMaxPct),
+         "Retest       within %d bars, tolerance %.2f%%"
+         % (settings.retestBars, settings.retestTolPct),
+         "Stop         %s   Target %gR   Square off %s"
+         % (settings.stopMode, settings.targetR, settings.sqOffTime)]))
+    out = args.out or os.path.join(
+        config.LOG_DIR, "breakdown_%s_%s.csv"
+        % (inst.symbol, datetime.now().strftime("%Y%m%d_%H%M%S")))
     bt.export_trades(result, out)
     print("\n  Trades written to %s\n" % out)
     return 0
@@ -266,6 +313,9 @@ def main() -> int:
 
     p = sub.add_parser("backtest", help="replay historical candles")
     common(p)
+    p.add_argument("--strategy", choices=["orb", "breakdown"], default="orb",
+                   help="orb = the ported indicator; breakdown = "
+                        "trend/consolidation/breakdown/retest short")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD")

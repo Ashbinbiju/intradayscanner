@@ -211,6 +211,14 @@ def main() -> int:
     bench_trades = trades_for({k: v for k, v in benchmark.items()}, store, settings)
     our_trades = trades_for(ours, store, settings)
 
+    # Persist the selections so the significance work does not need another
+    # five-minute scan every time a question is asked of the same result.
+    import json
+    with open(os.path.join(config.DATA_DIR, "validate_selections.json"),
+              "w", encoding="utf-8") as fh:
+        json.dump({"ours": ours,
+                   "benchmark": {k: sorted(v) for k, v in benchmark.items()}}, fh)
+
     print("\n" + "=" * 74)
     print("  Same days, same engine, same limits")
     print("=" * 74)

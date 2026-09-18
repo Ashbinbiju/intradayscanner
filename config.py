@@ -255,6 +255,74 @@ class StrategySettings:
         return asdict(self)
 
 
+@dataclass
+class BreakdownSettings:
+    """Trend -> consolidation -> breakdown -> retest -> short.
+
+    Thresholds are percentages of price, not rupees, so one set works across
+    a 90-rupee stock and a 4,000-rupee one.
+    """
+
+    # -- Session ----------------------------------------------------------
+    tzIn: str = "Asia/Kolkata"
+    sigSess: str = "0930-1500"      # when an entry may fire, IST
+    sqOffTime: str = "15:15"
+    sqOffTz: str = "Asia/Kolkata"
+
+    # -- (1) the run-up ---------------------------------------------------
+    trendBars: int = 24             # bars looked back for the rally (2h on 5-min)
+    trendPct: float = 2.0           # it must have covered at least this much
+
+    # -- (2) the consolidation --------------------------------------------
+    consolMinBars: int = 4          # fewer than this is a pause, not a range
+    consolMaxBars: int = 24
+    consolMaxPct: float = 1.5       # range width as a % of price
+
+    # -- (3) the breakdown ------------------------------------------------
+    breakBufPct: float = 0.05       # close must clear the floor by this much
+
+    # -- (4) the retest ---------------------------------------------------
+    retestBars: int = 12            # give up if it does not come back by then
+    retestTolPct: float = 0.30      # "back at the level" means within this
+    requireRejection: bool = True   # and it must close back under it
+
+    # -- (5) risk ---------------------------------------------------------
+    atrLen: int = 14
+    stopMode: str = "Retest high"   # or "ATR"
+    stopAtrMult: float = 1.5
+    stopBufPct: float = 0.10        # stop sits this far above the retest high
+    targetR: float = 2.0            # "1:2 max"
+    maxTradesPerDay: int = 2
+    #  When one bar spans both the stop and the target, which filled first is
+    #  unknowable from 5-minute data. Assume the stop -- a backtest that awards
+    #  the target flatters every result, and the difference compounds over a
+    #  thousand trades.
+    pessimisticSameBar: bool = True
+    #  Skip a setup whose stop would be nearer than this. A stop 0.1% away
+    #  gives a beautiful R multiple and a move too small to survive costs.
+    minRiskPct: float = 0.0
+
+    def validate(self) -> None:
+        if self.consolMinBars < 2 or self.consolMaxBars < self.consolMinBars:
+            raise ValueError("consolMinBars must be >= 2 and <= consolMaxBars")
+        if self.consolMaxPct <= 0:
+            raise ValueError("consolMaxPct must be > 0")
+        if self.trendBars < 1 or self.trendPct <= 0:
+            raise ValueError("trendBars must be >= 1 and trendPct > 0")
+        if self.retestBars < 1:
+            raise ValueError("retestBars must be >= 1")
+        if self.retestTolPct < 0:
+            raise ValueError("retestTolPct must be >= 0")
+        if self.stopMode not in ("Retest high", "ATR"):
+            raise ValueError("stopMode must be 'Retest high' or 'ATR'")
+        if self.targetR <= 0:
+            raise ValueError("targetR must be > 0")
+        if self.atrLen < 1:
+            raise ValueError("atrLen must be >= 1")
+        if self.maxTradesPerDay < 1:
+            raise ValueError("maxTradesPerDay must be >= 1")
+
+
 # ===========================================================================
 #  Instrument + execution
 # ===========================================================================

@@ -20,8 +20,9 @@ FILES = [
     "orbfvg/pine.py", "orbfvg/strategy.py", "orbfvg/angel.py",
     "orbfvg/broker.py", "orbfvg/backtest.py", "orbfvg/live.py",
     "orbfvg/instruments.py", "orbfvg/screener.py", "orbfvg/upstox.py",
+    "orbfvg/breakdown.py",
     "orbfvg/feed.py", "orbfvg/universe.py",
-    "tests/test_strategy.py", "tests/test_broker.py",
+    "tests/test_strategy.py", "tests/test_broker.py", "tests/test_breakdown.py",
 ]
 
 
@@ -45,6 +46,7 @@ def main():
         ok = False
     ok &= run("engine tests", [sys.executable, "tests/test_strategy.py"])
     ok &= run("broker tests", [sys.executable, "tests/test_broker.py"])
+    ok &= run("breakdown tests", [sys.executable, "tests/test_breakdown.py"])
     print("\n%s" % ("All checks passed." if ok else "CHECKS FAILED."))
     return 0 if ok else 1
 

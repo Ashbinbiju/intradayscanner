@@ -211,6 +211,68 @@ deliberately preserved:
 
 ---
 
+## Second strategy: breakdown + retest short
+
+`--strategy breakdown` runs a different idea entirely — a bull trap rather
+than a breakout:
+
+1. **Trend** — price runs up hard
+2. **Consolidation** — it stops going up and goes sideways under the high
+3. **Breakdown** — the floor of that range gives way on a close
+4. **Retest** — price climbs back to the broken floor and fails there
+5. **Short** — entry on the failure, stop above it, target 2R
+
+Short only, by design: the setup *is* a failed up-move.
+
+```bash
+python run.py backtest --strategy breakdown --symbol RELIANCE-EQ --days 25
+```
+
+The range is anchored to the swing high, not grown backwards until it stops
+being tight — growing it walks into the tail of the rally and drags the
+"support" down to a rally low, so the breakdown never fires. Patterns are
+intraday only; a range spanning the close would read the overnight gap as a
+breakdown.
+
+### It does not survive costs. Here is the arithmetic
+
+Over 1,380 trades on 273 symbols across 20 sessions the raw pattern has a
+**real** gross edge — +0.083R per trade, t = 2.21, significant at 95%. That is
+a stronger statistical signal than anything the ORB work produced.
+
+It still loses money, because the entries are extremely tight:
+
+```
+median stop   0.27% of price
+```
+
+Sizing by risk means a tight stop buys a **large** position, and brokerage and
+STT scale with position size, not with risk. A 0.08% round trip on a 0.27%
+stop is **0.30R per trade** — six times what the same costs take from a 1.5%
+stop. The gross edge is 0.083R. The costs are 0.30R.
+
+| Stop | trades | median risk | gross R | net R | net/trade | t |
+|---|---|---|---|---|---|---|
+| Retest high (as drawn) | 1380 | 0.27% | +66.2 | −399.7 | −0.290 | −7.76 |
+| ATR ×1.0 | 1325 | 0.39% | +76.0 | −204.7 | −0.155 | −4.03 |
+| ATR ×1.5 | 1280 | 0.60% | +44.1 | −135.2 | −0.106 | −2.95 |
+| ATR ×2.0 | 1259 | 0.79% | +36.9 | −94.8 | −0.075 | −2.32 |
+
+Widening the stop helps a lot and still never reaches break-even. Filtering to
+setups with a stop wider than 1.2% does turn positive (+3.0R over 73 trades),
+but that is 73 trades found by trying five thresholds on one month — t ≈ 0.25,
+which is nothing.
+
+Two modelling choices are deliberately unflattering, because the opposite
+choices are how a backtest lies: when one bar spans both the stop and the
+target, `pessimisticSameBar` takes the stop (worth 48R over this sample), and
+`minRiskPct` exists to skip setups too tight to trade.
+
+The engine is tested and wired up, so this is a measurement rather than a
+dead end — but as specified, it is not tradable on NSE intraday costs.
+
+---
+
 ## Our own stock selection
 
 `build_universe.py` replaces the third-party screener with something computed

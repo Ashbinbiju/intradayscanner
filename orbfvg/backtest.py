@@ -116,9 +116,13 @@ class BacktestResult:
         return worst
 
 
-def run(bars: List[Bar], settings) -> BacktestResult:
-    """Feed every bar through a fresh engine and pair entries with exits."""
-    strategy = ORBFVGStrategy(settings)
+def run(bars: List[Bar], settings, engine=ORBFVGStrategy) -> BacktestResult:
+    """Feed every bar through a fresh engine and pair entries with exits.
+
+    `engine` is any class taking the settings and exposing `on_bar` -> events,
+    so a second strategy can reuse all of the reporting below.
+    """
+    strategy = engine(settings)
     result = BacktestResult(bars=len(bars))
     if bars:
         result.start, result.end = bars[0].time, bars[-1].time
@@ -150,7 +154,7 @@ def run(bars: List[Bar], settings) -> BacktestResult:
                     if event.closes_position:
                         open_trade.exit_time = event.time
                         open_trade.exit = event.price
-                        open_trade.reason = "T3"
+                        open_trade.reason = "T%d" % (event.target_no or 3)
                         open_trade = None
                 elif event.type is EventType.STOP_HIT:
                     open_trade.exit_time = event.time
@@ -238,6 +242,55 @@ def format_report(result: BacktestResult, symbol: str, settings) -> str:
         add("")
         add("  No trades were taken in this window.")
     return "\n".join(lines)
+
+
+def format_simple_report(result: BacktestResult, symbol: str, title: str,
+                         lines_of_settings=()) -> str:
+    """A report that makes no assumptions about which engine produced it."""
+    s = result.summary()
+    out = ["=" * 74, "  %s    %s" % (title, symbol), "=" * 74]
+    if result.start and result.end:
+        out.append("  Period        %s  ->  %s"
+                   % (result.start.strftime("%Y-%m-%d %H:%M"),
+                      result.end.strftime("%Y-%m-%d %H:%M")))
+    out.append("  Bars          %d" % s["bars"])
+    out.extend("  %s" % line for line in lines_of_settings)
+    out.append("-" * 74)
+    out.append("  Trades        %d   (%d long / %d short)"
+               % (s["trades"], s["longs"], s["shorts"]))
+    out.append("  Win rate      %.1f%%   (%d win / %d loss / %d scratch)"
+               % (s["win_rate"], s["wins"], s["losses"], s["scratches"]))
+    out.append("  Total R       %+.2f      Average %+.3fR" % (s["total_r"], s["avg_r"]))
+    out.append("  Profit factor %s" % ("inf" if s["profit_factor"] == float("inf")
+                                       else "%.2f" % s["profit_factor"]))
+    out.append("  Max drawdown  %.2fR" % s["max_drawdown_r"])
+    out.append("  Total points  %+.2f" % s["total_points"])
+
+    closed = result.closed
+    if closed:
+        risks = sorted(abs(t.stop - t.entry) / t.entry * 100 for t in closed)
+        median_risk = risks[len(risks) // 2]
+        cost_r = sum(0.08 / (abs(t.stop - t.entry) / t.entry * 100) for t in closed)
+        out.append("-" * 74)
+        out.append("  Median stop   %.2f%% of price" % median_risk)
+        out.append("  Cost at 0.08%% round trip: %.1fR total, %.3fR per trade"
+                   % (cost_r, cost_r / len(closed)))
+        out.append("  Net of costs  %+.2fR   (%+.3fR per trade)"
+                   % (s["total_r"] - cost_r, (s["total_r"] - cost_r) / len(closed)))
+        out.append("")
+        out.append("  %-16s %-5s %9s %9s %9s %-12s %7s"
+                   % ("ENTRY", "SIDE", "PRICE", "STOP", "EXIT", "REASON", "R"))
+        out.append("  " + "-" * 72)
+        for t in closed[:40]:
+            out.append("  %-16s %-5s %9.2f %9.2f %9.2f %-12s %+7.2f"
+                       % (t.entry_time.strftime("%Y-%m-%d %H:%M"), t.side, t.entry,
+                          t.stop, t.exit, t.reason, t.r_multiple))
+        if len(closed) > 40:
+            out.append("  ... and %d more" % (len(closed) - 40))
+    else:
+        out.append("")
+        out.append("  No trades were taken in this window.")
+    return chr(10).join(out)
 
 
 def export_trades(result: BacktestResult, path: str) -> str:
