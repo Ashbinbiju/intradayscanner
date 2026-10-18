@@ -323,6 +323,72 @@ class BreakdownSettings:
             raise ValueError("maxTradesPerDay must be >= 1")
 
 
+@dataclass
+class SupertrendSettings:
+    """Supertrend flip with Entry / SL / TP1-TP3, run as an intraday system.
+
+    Signals come from the Pine "Supertrend with Entry, TP1, TP2 & TP3" logic
+    (ta.supertrend flip on `tfMinutes` candles built from the 5-minute feed);
+    the intraday rules -- entry window, square-off, exit method -- are
+    additions so it can be traded MIS.
+    """
+
+    # -- Session (all wall-clock times are the signal candle's CLOSE, IST) --
+    tzIn: str = "Asia/Kolkata"
+    tfMinutes: int = 15                 # signal timeframe, built from the feed
+    barMinutes: int = 5                 # what the feed delivers
+    sessionStart: str = "09:15"         # candles align to this
+    entryFrom: str = "09:30"            # first signal close that may enter
+    entryTo: str = "12:50"              # last one; no new entries after this
+    sqOffTime: str = "15:00"            # flatten at the close of the bar opening here
+    sqOffTz: str = "Asia/Kolkata"
+
+    # -- Supertrend (Pine defaults) ----------------------------------------
+    factor: float = 2.5
+    atrPeriod: int = 14
+
+    # -- Risk (Pine defaults) ----------------------------------------------
+    slAtrMult: float = 1.5
+    r1: float = 1.0
+    r2: float = 2.0
+    r3: float = 3.0
+
+    # -- Exit method -------------------------------------------------------
+    #  T3          fixed stop, close at T3 (the indicator's levels as drawn)
+    #  T1          fixed stop, close at T1 (what the indicator's stats table scores)
+    #  Step trail  no fixed target; stop -> entry at T1, -> T1 at T2, -> T2 at T3
+    #  ST trail    no fixed target; stop follows the Supertrend line
+    exitMode: str = "T3"
+    exitOnFlip: bool = True             # an opposite signal closes the trade
+    allowL: bool = True
+    allowS: bool = True
+    maxTradesPerDay: int = 0            # per symbol; 0 = no cap
+    #  One bar spanning stop and target: assume the stop, like the indicator's
+    #  own statistics do.
+    pessimisticSameBar: bool = True
+    mintick: float = 0.05
+
+    EXIT_MODES = ("T3", "T1", "Step trail", "ST trail")
+
+    def validate(self) -> None:
+        if self.exitMode not in self.EXIT_MODES:
+            raise ValueError("exitMode must be one of %s" % (self.EXIT_MODES,))
+        if self.tfMinutes < self.barMinutes or self.tfMinutes % self.barMinutes:
+            raise ValueError("tfMinutes must be a multiple of barMinutes")
+        if self.factor <= 0 or self.atrPeriod < 1 or self.slAtrMult <= 0:
+            raise ValueError("factor and slAtrMult must be > 0, atrPeriod >= 1")
+        if min(self.r1, self.r2, self.r3) < 0.1:
+            raise ValueError("target R multiples must be >= 0.1")
+        for name in ("sessionStart", "entryFrom", "entryTo"):
+            hh, _, mm = getattr(self, name).partition(":")
+            if not (hh.isdigit() and mm.isdigit()):
+                raise ValueError("%s must be HH:MM" % name)
+        if self.entryFrom > self.entryTo:
+            raise ValueError("entryFrom must not be after entryTo")
+        if self.maxTradesPerDay < 0:
+            raise ValueError("maxTradesPerDay must be >= 0")
+
+
 # ===========================================================================
 #  Instrument + execution
 # ===========================================================================

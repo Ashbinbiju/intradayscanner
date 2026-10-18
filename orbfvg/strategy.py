@@ -91,6 +91,7 @@ class Event:
     risk: float = NA                    # per-unit risk, in price
     target_no: Optional[int] = None     # 1, 2 or 3 for TARGET_HIT
     closes_position: bool = False       # broker should flatten on this event
+    reason: Optional[str] = None        # exit label for the trade list, when not implied by type
 
     def __str__(self) -> str:
         return "[%s] %s" % (self.time.strftime("%Y-%m-%d %H:%M"), self.message)

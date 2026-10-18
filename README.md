@@ -273,6 +273,54 @@ dead end — but as specified, it is not tradable on NSE intraday costs.
 
 ---
 
+## Third strategy: Supertrend flip, intraday
+
+`--strategy supertrend` (and **Strategy → Supertrend** in the scanner sidebar)
+runs the Pine indicator *"Supertrend with Entry, TP1, TP2 & TP3"* with its
+default inputs, plus the rules that make it an MIS system:
+
+1. **Signal** — `ta.supertrend(2.5, 14)` flips on a **15-minute** candle
+   (built from the 5-minute feed, aligned to 09:15). Up = BUY, down = SELL.
+2. **Entry** — at the signal candle's close, only when that close falls
+   **09:30–12:50** IST.
+3. **Risk** — stop `1.5 × ATR(14)` from entry, targets 1R / 2R / 3R, checked
+   on every 5-minute bar. One bar spanning stop and target takes the stop; a
+   gap through the stop fills at the open.
+4. **Exit** — pick one with `exitMode`: `T3`, `T1`, `Step trail` (stop to
+   entry at T1, to T1 at T2, to T2 at T3) or `ST trail` (stop follows the
+   Supertrend line). An opposite flip closes the trade (`exitOnFlip`), and
+   everything is flat at the close of the **15:00** bar.
+
+```bash
+python run.py backtest --strategy supertrend --symbol GRASIM-EQ --days 30
+python run.py backtest --strategy supertrend --symbol GRASIM-EQ --set exitMode="ST trail" --set tfMinutes=30
+```
+
+The Supertrend runs across days exactly as on a TradingView chart; only the
+trading is confined to the session. `tests/test_supertrend.py` pins the
+indicator maths against a direct transcription of `ta.supertrend` and each
+intraday rule.
+
+### What it measured
+
+Over 14,230 trades on 24 NSE stocks, Jan 2022 – Oct 2026, 15-minute signals,
+these rules:
+
+| Exit | Gross R | Net R (0.10% round trip) | Win % |
+|---|---|---|---|
+| T3 | −341 | −2,101 | 37% |
+| T1 | −396 | −2,156 | 47% |
+| Step trail | −296 | −2,056 | 33% |
+| ST trail | −357 | −2,117 | 36% |
+
+Negative before costs with every exit method, in every year and every entry
+slot. The 09:30 entries are the worst. Treat it as a tool for studying days,
+not as a proven edge. Candle feeds also differ slightly — a close a paisa
+either side of the line moves a signal by a candle, so individual trades can
+differ from a TradingView chart even though the logic matches.
+
+---
+
 ## Our own stock selection
 
 `build_universe.py` replaces the third-party screener with something computed
