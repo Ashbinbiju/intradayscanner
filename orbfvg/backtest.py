@@ -59,6 +59,7 @@ class BacktestResult:
     sessions: int = 0
     start: Optional[datetime] = None
     end: Optional[datetime] = None
+    engine: object = None               # the engine after the replay, for charts/snapshots
 
     # -- stats ------------------------------------------------------------
     @property
@@ -164,10 +165,11 @@ def run(bars: List[Bar], settings, engine=ORBFVGStrategy) -> BacktestResult:
                 elif event.type is EventType.SESSION_EXIT:
                     open_trade.exit_time = event.time
                     open_trade.exit = event.price
-                    open_trade.reason = "SESSION_END"
+                    open_trade.reason = event.reason or "SESSION_END"
                     open_trade = None
 
     result.sessions = len(sessions)
+    result.engine = strategy
     return result
 
 

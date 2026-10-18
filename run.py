@@ -174,6 +174,8 @@ def _load_bars(client, strategy, trade, days, date_from, date_to):
 def cmd_backtest(args) -> int:
     if getattr(args, "strategy", "orb") == "breakdown":
         return cmd_backtest_breakdown(args)
+    if getattr(args, "strategy", "orb") == "supertrend":
+        return cmd_backtest_supertrend(args)
     strategy, trade = build_settings(args)
     client = AngelClient()
     client.login()
@@ -238,6 +240,52 @@ def cmd_backtest_breakdown(args) -> int:
         % (inst.symbol, datetime.now().strftime("%Y%m%d_%H%M%S")))
     bt.export_trades(result, out)
     print("\n  Trades written to %s\n" % out)
+    return 0
+
+
+def cmd_backtest_supertrend(args) -> int:
+    """Supertrend flip with Entry / SL / TP1-TP3, intraday rules on top."""
+    from orbfvg.supertrend import SupertrendStrategy
+
+    settings = config.SupertrendSettings()
+    for pair in getattr(args, "set", None) or []:
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if not hasattr(settings, key):
+            raise SystemExit("Unknown setting %r. Valid names: %s"
+                             % (key, ", ".join(sorted(vars(settings)))))
+        setattr(settings, key, coerce(getattr(settings, key), value))
+    settings.validate()
+
+    _, trade = build_settings(args)
+    tz = ZoneInfo(settings.tzIn)
+    end = datetime.strptime(args.date_to, "%Y-%m-%d").replace(tzinfo=tz) + timedelta(days=1)         if args.date_to else datetime.now(tz)
+    start = datetime.strptime(args.date_from, "%Y-%m-%d").replace(tzinfo=tz)         if args.date_from else end - timedelta(days=args.days)
+    feed = MarketData()
+    inst = feed.instrument(trade.symbol, trade.exchange)
+    settings.mintick = inst.tick_size
+    bars = feed.candles(trade.exchange, trade.symbol, trade.interval, start, end, tz=tz)
+    if not bars:
+        print("No candles returned for that window.")
+        return 1
+    print("  candles via %s (%d bars)" % (feed.last_source, len(bars)))
+
+    result = bt.run(bars, settings, engine=SupertrendStrategy)
+    print("")
+    print(bt.format_simple_report(
+        result, inst.symbol, "Supertrend flip (%dm)" % settings.tfMinutes,
+        ["Supertrend   factor %g, ATR %d" % (settings.factor, settings.atrPeriod),
+         "Stop         %g x ATR   Targets %g/%g/%gR   Exit %s"
+         % (settings.slAtrMult, settings.r1, settings.r2, settings.r3, settings.exitMode),
+         "Entries      signal close %s-%s   Square off %s"
+         % (settings.entryFrom, settings.entryTo, settings.sqOffTime)]))
+    out = args.out or os.path.join(
+        config.LOG_DIR, "supertrend_%s_%s.csv"
+        % (inst.symbol, datetime.now().strftime("%Y%m%d_%H%M%S")))
+    bt.export_trades(result, out)
+    print("
+  Trades written to %s
+" % out)
     return 0
 
 
@@ -313,9 +361,10 @@ def main() -> int:
 
     p = sub.add_parser("backtest", help="replay historical candles")
     common(p)
-    p.add_argument("--strategy", choices=["orb", "breakdown"], default="orb",
+    p.add_argument("--strategy", choices=["orb", "breakdown", "supertrend"], default="orb",
                    help="orb = the ported indicator; breakdown = "
-                        "trend/consolidation/breakdown/retest short")
+                        "trend/consolidation/breakdown/retest short; supertrend = "
+                        "15m Supertrend flip with SL/TP1-TP3, intraday")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD")

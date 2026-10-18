@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-ORB + FVG scanner -- a Streamlit view of which stocks actually triggered.
+Intraday scanner -- a Streamlit view of which stocks actually triggered.
 
     streamlit run scanner.py
 
@@ -45,11 +45,18 @@ from orbfvg import backtest as bt
 from orbfvg import screener
 from orbfvg import universe as U
 from orbfvg.strategy import Bar
+from orbfvg.supertrend import SupertrendStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
 LONDON = ZoneInfo("Europe/London")
 
-st.set_page_config(page_title="ORB + FVG Scanner", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Intraday Scanner", page_icon="📈", layout="wide")
+
+STRATEGIES = ["ORB + FVG", "Supertrend"]
+
+
+def is_supertrend(settings):
+    return isinstance(settings, config.SupertrendSettings)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +149,14 @@ def session_clock(settings, now=None):
     from orbfvg.pine import SessionWindow
 
     now = now or datetime.now(IST)
+    if is_supertrend(settings):
+        def at(text):
+            hh, mm = (int(x) for x in text.split(":"))
+            return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return {"or_start": None, "or_end": None,
+                "entry_from": at(settings.entryFrom), "entry_to": at(settings.entryTo),
+                "sig_end": at(settings.entryTo),
+                "square_off": at(settings.sqOffTime) if settings.sqOffTime else None}
     tz = ZoneInfo(settings.tzIn)
     or_win = SessionWindow.parse(settings.orSess)
     sig_win = SessionWindow.parse(settings.sigSess)
@@ -182,6 +197,20 @@ def strategy_phase(settings, now=None):
 
     def until(when):
         return max(0, int((when - now).total_seconds())) if when else None
+
+    if is_supertrend(settings):
+        first, last = clock["entry_from"], clock["entry_to"]
+        if now < first:
+            return ("waiting", "WAITING", "entries from %s" % first.strftime("%H:%M"),
+                    until(first))
+        if now < last:
+            return ("armed", "ENTRIES LIVE", "new entries until %s" % last.strftime("%H:%M"),
+                    until(last))
+        if finish and now < finish:
+            return ("managing", "MANAGING", "squares off %s" % finish.strftime("%H:%M"),
+                    until(finish))
+        return ("done", "DONE",
+                "squared off %s" % (finish.strftime("%H:%M") if finish else ""), None)
 
     if or_start and now < or_start:
         return ("waiting", "WAITING",
@@ -287,8 +316,16 @@ def build_settings(ui):
     missing keys this build expects, and falling back to the configured
     default is better than a crash.
     """
-    s, _ = config.load()
     ui = ui or {}
+    if ui.get("strategy") == "Supertrend":
+        st_settings = config.SupertrendSettings()
+        for key in ("tfMinutes", "factor", "atrPeriod", "slAtrMult", "exitMode",
+                    "exitOnFlip", "entryFrom", "entryTo", "sqOffTime"):
+            if ui.get("st_" + key) is not None:
+                setattr(st_settings, key, ui["st_" + key])
+        st_settings.validate()
+        return st_settings
+    s, _ = config.load()
     for ui_key, attr in (("atrMult", "atrMult"), ("strongClose", "strongClose"),
                          ("useFvg", "useFvg"), ("fvgAtrX", "fvgAtrX"),
                          ("bufPct", "bufPct"), ("useTrail", "useTrail"),
@@ -318,14 +355,18 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
             continue
         bars = to_bars(rows)
         settings.mintick = meta.get("tick", 0.05)
-        result = bt.run(bars, settings)
+        supertrend = is_supertrend(settings)
+        if supertrend:
+            result = bt.run(bars, settings, engine=SupertrendStrategy)
+        else:
+            result = bt.run(bars, settings)
 
         day_bars = [b for b in bars if b.time.strftime("%Y-%m-%d") == target_day]
         if not day_bars:
             missing.append(symbol)
             continue
 
-        orb = [b for b in day_bars if in_or_window(b, settings)]
+        orb = [] if supertrend else [b for b in day_bars if in_or_window(b, settings)]
         ctx = {
             "bars": day_bars,
             "orb_high": max((b.high for b in orb), default=float("nan")),
@@ -333,6 +374,12 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
             "day_pct": (day_bars[-1].close / day_bars[0].open - 1) * 100,
             "events": [e for e in result.events if e.time.strftime("%Y-%m-%d") == target_day],
         }
+        if supertrend:
+            line = [(end, value, direction) for end, value, direction in result.engine.history
+                    if end.strftime("%Y-%m-%d") == target_day]
+            ctx["st_line"] = line
+            ctx["trend"] = ("UP" if line[-1][2] < 0 else "DOWN") if line else "-"
+            ctx["st_last"] = line[-1][1] if line else float("nan")
         context[symbol] = ctx
         for t in result.trades:
             if t.entry_time.strftime("%Y-%m-%d") == target_day:
@@ -418,6 +465,19 @@ def candle_chart(symbol, ctx, trade, settings):
         if layer is not None:
             layers.append(layer)
 
+    if ctx.get("st_line"):
+        # Plotted at each signal candle's open, as TradingView draws it.
+        tf = timedelta(minutes=getattr(settings, "tfMinutes", 15))
+        line = pd.DataFrame([{"time": (end - tf).replace(tzinfo=None), "st": value,
+                              "trend": "up" if direction < 0 else "down"}
+                             for end, value, direction in ctx["st_line"]])
+        layers.append(alt.Chart(line).mark_point(size=14, filled=True).encode(
+            x="time:T", y="st:Q",
+            color=alt.Color("trend:N", legend=None,
+                            scale=alt.Scale(domain=["up", "down"],
+                                            range=["#089981", "#f23645"])),
+            tooltip=["time:T", "st:Q", "trend:N"]))
+
     if trade is not None:
         up = trade.side == "BUY"
         for value, color, label in [
@@ -448,7 +508,7 @@ def candle_chart(symbol, ctx, trade, settings):
 # ---------------------------------------------------------------------------
 #  UI
 # ---------------------------------------------------------------------------
-st.title("ORB + FVG Scanner")
+st.title("Intraday Scanner")
 
 with st.sidebar:
     st.header("Mode")
@@ -591,22 +651,55 @@ with st.sidebar:
 
     st.header("Strategy")
     ui = {}
-    ui["atrMult"] = st.slider("Stop  × ATR", 1.0, 4.0, 3.0, 0.1,
-                              help="Pine ships 1.5; testing favoured 3.0")
-    ui["strongClose"] = st.slider("Strong close", 0.0, 1.0, 0.5, 0.05,
-                                  help="0 = off. Breakout bar must close in this "
-                                       "fraction of its own range")
-    ui["bufPct"] = st.slider("Breakout buffer  % of range", 0.0, 25.0, 5.0, 1.0)
-    ui["useFvg"] = st.checkbox("Require FVG", True)
-    ui["fvgAtrX"] = st.slider("Min FVG  × ATR", 0.0, 1.0, 0.15, 0.05,
-                              disabled=not ui["useFvg"])
-    ui["minRangePct"] = st.slider("Min range  % of price", 0.0, 2.0, 0.0, 0.1,
-                                  help="0 = off. Skips thin, choppy ranges")
-    ui["useTrail"] = st.checkbox("Trailing stop", False)
-    ui["trailMode"] = st.selectbox("Trail mode", ["ATR", "Targets", "Both"],
-                                   disabled=not ui["useTrail"])
-    ui["sqOff"] = st.text_input("Square off at (IST)", "15:15",
-                                help="Blank disables — matches TradingView")
+    ui["strategy"] = st.selectbox(
+        "Strategy", STRATEGIES, index=0,
+        help="ORB + FVG: opening-range breakout confirmed by a fair-value gap. "
+             "Supertrend: the 'Supertrend with Entry, TP1, TP2 & TP3' "
+             "indicator's flip signal, traded intraday.")
+
+    if ui["strategy"] == "Supertrend":
+        ui["st_tfMinutes"] = st.select_slider(
+            "Signal timeframe", [5, 15, 30, 60], value=15,
+            format_func=lambda v: "%dm" % v,
+            help="Candles built from the 5-minute feed, aligned to 09:15")
+        c1, c2 = st.columns(2)
+        ui["st_factor"] = c1.number_input("Factor", 0.5, 10.0, 2.5, 0.1)
+        ui["st_atrPeriod"] = int(c2.number_input("ATR period", 1, 100, 14))
+        ui["st_slAtrMult"] = st.slider("Stop  × ATR", 0.5, 4.0, 1.5, 0.1,
+                                       help="Indicator default 1.5. Targets sit at "
+                                            "1R / 2R / 3R")
+        ui["st_exitMode"] = st.selectbox(
+            "Exit", list(config.SupertrendSettings.EXIT_MODES),
+            help="T3 / T1: fixed stop, close at that target. Step trail: stop to "
+                 "entry at T1, to T1 at T2, to T2 at T3. ST trail: stop follows "
+                 "the Supertrend line.")
+        ui["st_exitOnFlip"] = st.checkbox("Opposite signal closes the trade", True)
+        c1, c2 = st.columns(2)
+        ui["st_entryFrom"] = c1.text_input("Entries from", "09:30",
+                                           help="Signal candle close time, IST")
+        ui["st_entryTo"] = c2.text_input("until", "12:50")
+        ui["st_sqOffTime"] = st.text_input(
+            "Square off at (IST)", "15:00",
+            help="Exits at the close of the 5-minute bar opening at this time")
+        st.caption("Measured on 24 stocks over 2022-2026 (15m, these defaults): "
+                   "negative with every exit method, even before costs.")
+    else:
+        ui["atrMult"] = st.slider("Stop  × ATR", 1.0, 4.0, 3.0, 0.1,
+                                  help="Pine ships 1.5; testing favoured 3.0")
+        ui["strongClose"] = st.slider("Strong close", 0.0, 1.0, 0.5, 0.05,
+                                      help="0 = off. Breakout bar must close in this "
+                                           "fraction of its own range")
+        ui["bufPct"] = st.slider("Breakout buffer  % of range", 0.0, 25.0, 5.0, 1.0)
+        ui["useFvg"] = st.checkbox("Require FVG", True)
+        ui["fvgAtrX"] = st.slider("Min FVG  × ATR", 0.0, 1.0, 0.15, 0.05,
+                                  disabled=not ui["useFvg"])
+        ui["minRangePct"] = st.slider("Min range  % of price", 0.0, 2.0, 0.0, 0.1,
+                                      help="0 = off. Skips thin, choppy ranges")
+        ui["useTrail"] = st.checkbox("Trailing stop", False)
+        ui["trailMode"] = st.selectbox("Trail mode", ["ATR", "Targets", "Both"],
+                                       disabled=not ui["useTrail"])
+        ui["sqOff"] = st.text_input("Square off at (IST)", "15:15",
+                                    help="Blank disables — matches TradingView")
 
     st.header("Data")
     prefer = st.radio(
@@ -674,20 +767,27 @@ def _hms(seconds):
 def live_header(day, symbols, trades, context, settings):
     now = datetime.now(IST)
     phase, label, nxt, secs = strategy_phase(settings, now)
-    icon = {"waiting": "🟡", "range": "🟠", "armed": "🟢",
+    icon = {"waiting": "🟡", "range": "🟠", "armed": "🟢", "managing": "🔵",
             "done": "⚪", "closed": "🔴"}[phase]
     live_trades = [t for t in trades if t.exit != t.exit]
 
     c = st.columns(5)
     c[0].metric("Strategy", "%s %s" % (icon, label), nxt)
-    c[1].metric("Next bar" if phase in ("range", "armed") else "Countdown",
-                _hms(seconds_to_next_bar(now)) if phase in ("range", "armed")
-                else _hms(secs))
+    ticking = phase in ("range", "armed", "managing")
+    c[1].metric("Next bar" if ticking else "Countdown",
+                _hms(seconds_to_next_bar(now)) if ticking else _hms(secs))
     c[2].metric("Watching", len(symbols))
     c[3].metric("Signals today", len(trades))
     c[4].metric("Open now", len(live_trades))
 
     clock = session_clock(settings, now)
+    if is_supertrend(settings):
+        plan = ("Supertrend %dm (%g, %d) · entries %s–%s · square-off %s · exit %s"
+                % (settings.tfMinutes, settings.factor, settings.atrPeriod,
+                   settings.entryFrom, settings.entryTo, settings.sqOffTime or "—",
+                   settings.exitMode))
+        st.caption("%s  ·  refreshed %s IST" % (plan, now.strftime("%H:%M:%S")))
+        return phase
     plan = "Range %s–%s · entries from %s · square-off %s (%s in %s)" % (
         clock["or_start"].strftime("%H:%M") if clock["or_start"] else "—",
         clock["or_end"].strftime("%H:%M") if clock["or_end"] else "—",
@@ -714,7 +814,7 @@ def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=Tru
     # grow all afternoon inflates the scan (one candle request per symbol per
     # bar, at 3/sec) and drifts away from how the strategy was tested.
     locked = st.session_state.get("locked_universe")
-    if lock_after_range and phase_key in ("armed", "done"):
+    if lock_after_range and phase_key in ("armed", "managing", "done"):
         if locked:
             symbols = locked
         else:
@@ -763,6 +863,11 @@ def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=Tru
                 "%": st.column_config.NumberColumn(format="%+.2f%%"),
                 "To stop %": st.column_config.NumberColumn(format="%.2f%%"),
             })
+    elif is_supertrend(settings):
+        if phase == "waiting":
+            st.caption("Entries open at %s." % settings.entryFrom)
+        elif phase == "armed":
+            st.caption("Entries are live; no Supertrend flip has fired yet.")
     elif phase == "waiting":
         st.caption("Nothing can trigger yet — the opening range has not started "
                    "forming.")
@@ -869,11 +974,16 @@ def render_results(trades, context, missing, day, ui, details,
 
             m = st.columns(4)
             m[0].metric("Day move", "%+.2f%%" % ctx["day_pct"])
-            m[1].metric("Range high", "%.2f" % ctx["orb_high"])
-            m[2].metric("Range low", "%.2f" % ctx["orb_low"])
-            width = ctx["orb_high"] - ctx["orb_low"]
-            mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
-            m[3].metric("Range width", "%.2f (%.2f%%)" % (width, width / mid * 100 if mid else 0))
+            if "st_line" in ctx:
+                m[1].metric("Trend at last bar", ctx["trend"])
+                m[2].metric("Supertrend", "%.2f" % ctx["st_last"])
+                m[3].metric("Signals today", sum(1 for t in trades if t.symbol == pick))
+            else:
+                m[1].metric("Range high", "%.2f" % ctx["orb_high"])
+                m[2].metric("Range low", "%.2f" % ctx["orb_low"])
+                width = ctx["orb_high"] - ctx["orb_low"]
+                mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
+                m[3].metric("Range width", "%.2f (%.2f%%)" % (width, width / mid * 100 if mid else 0))
 
             st.altair_chart(candle_chart(pick, ctx, trade, settings), use_container_width=True)
 
@@ -891,6 +1001,16 @@ def render_results(trades, context, missing, day, ui, details,
             rows = []
             for s in quiet:
                 ctx = context[s]
+                if "st_line" in ctx:
+                    rows.append({
+                        "Symbol": s,
+                        "Day %": round(ctx["day_pct"], 2),
+                        "Trend": ctx["trend"],
+                        "Supertrend": round(ctx["st_last"], 2),
+                        "Flips today": sum(1 for a, b in zip(ctx["st_line"], ctx["st_line"][1:])
+                                           if a[2] != b[2]),
+                    })
+                    continue
                 width = ctx["orb_high"] - ctx["orb_low"]
                 mid = (ctx["orb_high"] + ctx["orb_low"]) / 2
                 rows.append({
@@ -902,8 +1022,12 @@ def render_results(trades, context, missing, day, ui, details,
                 })
             st.dataframe(pd.DataFrame(rows).sort_values("Day %", ascending=False),
                          use_container_width=True, hide_index=True)
-            st.caption("Usually a breakout with no live FVG on the other side of it, "
-                       "or a range too thin to clear the buffer.")
+            if is_supertrend(settings):
+                st.caption("No flip inside the entry window — the trend held all "
+                           "morning, or it turned only after the cut-off.")
+            else:
+                st.caption("Usually a breakout with no live FVG on the other side of it, "
+                           "or a range too thin to clear the buffer.")
         if missing:
             st.warning("No candles for: %s" % ", ".join(missing))
         for err in st.session_state.get("errors", []):
@@ -913,7 +1037,7 @@ def render_results(trades, context, missing, day, ui, details,
 # ---------------------------------------------------------------------------
 #  Entry point
 # ---------------------------------------------------------------------------
-RESULT_SCHEMA = 2
+RESULT_SCHEMA = 3
 
 if live_mode:
     if not symbols:
