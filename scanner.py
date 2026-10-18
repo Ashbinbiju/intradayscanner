@@ -418,6 +418,19 @@ def pct_of(t):
     return (t.exit - t.entry) * (1 if t.side == "BUY" else -1) / t.entry * 100
 
 
+FEED_BAR = timedelta(minutes=5)
+
+
+def filled_at(moment):
+    """When an event actually happened: the close of the 5-minute bar it fired on.
+
+    Events are stamped with the bar's OPEN, as Pine does, so an entry taken at
+    the 09:30 close is stamped 09:25. Showing that to a trader reads as an
+    entry before 09:30, so every table shows the bar's close instead.
+    """
+    return (moment + FEED_BAR).strftime("%H:%M")
+
+
 def _fact(details, symbol, field):
     """A screener field for this symbol, when the universe came from the API."""
     value = (details.get(symbol) or {}).get(field)
@@ -734,7 +747,7 @@ def open_positions(trades, context):
         rows.append({
             "Symbol": t.symbol,
             "Side": t.side,
-            "In at": t.entry_time.strftime("%H:%M"),
+            "In at": filled_at(t.entry_time),
             "Entry": round(t.entry, 2),
             "Now": round(last, 2),
             "Open R": round((last - t.entry) * direction / risk, 2) if risk else None,
@@ -923,7 +936,7 @@ def render_results(trades, context, missing, day, ui, details,
                 rows.append({
                     "#": n,
                     "Take": "✅" if id(t) in taken_ids else "—",
-                    "Time": t.entry_time.strftime("%H:%M"),
+                    "Time": filled_at(t.entry_time),
                     "Symbol": t.symbol,
                     "Side": t.side,
                     "Entry": round(t.entry, 2),
@@ -932,7 +945,7 @@ def render_results(trades, context, missing, day, ui, details,
                     "T2": round(t.t2, 2),
                     "T3": round(t.t3, 2),
                     "Exit": round(t.exit, 2) if t.exit == t.exit else None,
-                    "Out": t.exit_time.strftime("%H:%M") if t.exit_time else "open",
+                    "Out": filled_at(t.exit_time) if t.exit_time else "open",
                     "Reason": t.reason,
                     "R": round(t.r_multiple, 2) if t.r_multiple == t.r_multiple else None,
                     "%": round(pct_of(t), 2) if t.exit == t.exit else None,
@@ -956,7 +969,7 @@ def render_results(trades, context, missing, day, ui, details,
                 with st.expander("%d signal(s) skipped by the cap" % len(skipped)):
                     for t, why in skipped:
                         st.write("%s **%s** %s — %s  (would have been %+.2fR)"
-                                 % (t.entry_time.strftime("%H:%M"), t.symbol, t.side,
+                                 % (filled_at(t.entry_time), t.symbol, t.side,
                                     why, t.r_multiple))
 
     # -- chart ------------------------------------------------------------------
@@ -990,7 +1003,7 @@ def render_results(trades, context, missing, day, ui, details,
             if ctx["events"]:
                 st.caption("Engine events")
                 for e in ctx["events"]:
-                    st.text("%s  %-13s %s" % (e.time.strftime("%H:%M"), e.type.value, e.message))
+                    st.text("%s  %-13s %s" % (filled_at(e.time), e.type.value, e.message))
 
     # -- no-trades --------------------------------------------------------------
     with tab_none:
