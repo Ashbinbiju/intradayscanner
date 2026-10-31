@@ -46,17 +46,27 @@ from orbfvg import screener
 from orbfvg import universe as U
 from orbfvg.strategy import Bar
 from orbfvg.supertrend import SupertrendStrategy
+from orbfvg.trendbreakout import TrendBreakoutStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
 LONDON = ZoneInfo("Europe/London")
 
 st.set_page_config(page_title="Intraday Scanner", page_icon="📈", layout="wide")
 
-STRATEGIES = ["ORB + FVG", "Supertrend"]
+STRATEGIES = ["ORB + FVG", "Supertrend", "Trend Breakout"]
 
 
 def is_supertrend(settings):
     return isinstance(settings, config.SupertrendSettings)
+
+
+def is_trendbreakout(settings):
+    return isinstance(settings, config.TrendBreakoutSettings)
+
+
+def is_windowed(settings):
+    """Strategies with a fixed entry window instead of an opening range."""
+    return is_supertrend(settings) or is_trendbreakout(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +159,7 @@ def session_clock(settings, now=None):
     from orbfvg.pine import SessionWindow
 
     now = now or datetime.now(IST)
-    if is_supertrend(settings):
+    if is_windowed(settings):
         def at(text):
             hh, mm = (int(x) for x in text.split(":"))
             return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -198,7 +208,7 @@ def strategy_phase(settings, now=None):
     def until(when):
         return max(0, int((when - now).total_seconds())) if when else None
 
-    if is_supertrend(settings):
+    if is_windowed(settings):
         first, last = clock["entry_from"], clock["entry_to"]
         if now < first:
             return ("waiting", "WAITING", "entries from %s" % first.strftime("%H:%M"),
@@ -317,6 +327,14 @@ def build_settings(ui):
     default is better than a crash.
     """
     ui = ui or {}
+    if ui.get("strategy") == "Trend Breakout":
+        tb_settings = config.TrendBreakoutSettings()
+        for key in ("tfMinutes", "slAtr", "tpR", "useRe", "useLate",
+                    "entryFrom", "entryTo", "sqOffTime"):
+            if ui.get("tb_" + key) is not None:
+                setattr(tb_settings, key, ui["tb_" + key])
+        tb_settings.validate()
+        return tb_settings
     if ui.get("strategy") == "Supertrend":
         st_settings = config.SupertrendSettings()
         for key in ("tfMinutes", "factor", "atrPeriod", "slAtrMult", "exitMode",
@@ -341,7 +359,10 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
          prefer="upstox"):
     """Run the engine over each symbol and collect that day's trades."""
     settings = build_settings(ui)
-    warm_from = (datetime.strptime(target_day, "%Y-%m-%d") - timedelta(days=14)).strftime("%Y-%m-%d")
+    # The trend breakout's 1H EMA 200 needs ~29 sessions of history to read a
+    # trend at all; the other engines are warm well inside two weeks.
+    warm_days = 60 if is_trendbreakout(settings) else 14
+    warm_from = (datetime.strptime(target_day, "%Y-%m-%d") - timedelta(days=warm_days)).strftime("%Y-%m-%d")
 
     trades, context, missing = [], {}, []
     progress = None if quiet else st.progress(0.0, text="Scanning...")
@@ -356,8 +377,11 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
         bars = to_bars(rows)
         settings.mintick = meta.get("tick", 0.05)
         supertrend = is_supertrend(settings)
+        trendbreakout = is_trendbreakout(settings)
         if supertrend:
             result = bt.run(bars, settings, engine=SupertrendStrategy)
+        elif trendbreakout:
+            result = bt.run(bars, settings, engine=TrendBreakoutStrategy)
         else:
             result = bt.run(bars, settings)
 
@@ -366,7 +390,7 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
             missing.append(symbol)
             continue
 
-        orb = [] if supertrend else [b for b in day_bars if in_or_window(b, settings)]
+        orb = [] if (supertrend or trendbreakout) else [b for b in day_bars if in_or_window(b, settings)]
         ctx = {
             "bars": day_bars,
             "orb_high": max((b.high for b in orb), default=float("nan")),
@@ -380,6 +404,13 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
             ctx["st_line"] = line
             ctx["trend"] = ("UP" if line[-1][2] < 0 else "DOWN") if line else "-"
             ctx["st_last"] = line[-1][1] if line else float("nan")
+        if trendbreakout:
+            snap = result.engine.snapshot()
+            ctx["tb"] = True
+            ctx["trend"] = snap["trend"]
+            ctx["ema_fast"], ctx["ema_slow"] = snap["ema_fast"], snap["ema_slow"]
+            ctx["next_buy"], ctx["next_sell"] = snap["next_buy"], snap["next_sell"]
+            ctx["waiting"] = snap["waiting_pullback"]
         context[symbol] = ctx
         for t in result.trades:
             if t.entry_time.strftime("%Y-%m-%d") == target_day:
@@ -668,9 +699,36 @@ with st.sidebar:
         "Strategy", STRATEGIES, index=0,
         help="ORB + FVG: opening-range breakout confirmed by a fair-value gap. "
              "Supertrend: the 'Supertrend with Entry, TP1, TP2 & TP3' "
-             "indicator's flip signal, traded intraday.")
+             "indicator's flip signal, traded intraday. "
+             "Trend Breakout: 1H EMA 50/200 trend + close beyond the prior "
+             "40 candles (the NSE Trend Breakout v1.1 indicator).")
 
-    if ui["strategy"] == "Supertrend":
+    if ui["strategy"] == "Trend Breakout":
+        ui["tb_tfMinutes"] = st.select_slider(
+            "Signal timeframe", [5, 15], value=15,
+            format_func=lambda v: "%dm" % v,
+            help="Candles built from the 5-minute feed, aligned to 09:15. "
+                 "The trend is always the previous completed 1H candle")
+        ui["tb_slAtr"] = st.slider("Stop  × ATR", 0.5, 4.0, 1.5, 0.1,
+                                   help="Indicator default 1.5, from the fill")
+        ui["tb_tpR"] = st.slider("Target (R)", 1.0, 5.0, 3.0, 0.5)
+        ui["tb_useLate"] = st.checkbox(
+            "Late-entry guard", True,
+            help="A breakout more than 4 ATR from the 21-candle swing waits for a "
+                 "0.5 ATR pullback, then enters on the retest")
+        ui["tb_useRe"] = st.checkbox("Re-enter once after a stop-out", True)
+        c1, c2 = st.columns(2)
+        ui["tb_entryFrom"] = c1.text_input("Fills from", "09:30",
+                                           help="Fill time = next candle's open, IST")
+        ui["tb_entryTo"] = c2.text_input("until", "13:00",
+                                         help="v1.1 default. v1.0 used 14:30")
+        ui["tb_sqOffTime"] = st.text_input(
+            "Square off at (IST)", "15:00",
+            help="Exit at the open of the first candle starting at or after this")
+        st.caption("Needs ~60 days of history per symbol for the 1H EMA 200, so "
+                   "the first scan is slower. Measured on 37 NSE stocks it is "
+                   "about break-even before costs and negative after them.")
+    elif ui["strategy"] == "Supertrend":
         ui["st_tfMinutes"] = st.select_slider(
             "Signal timeframe", [5, 15, 30, 60], value=15,
             format_func=lambda v: "%dm" % v,
@@ -794,6 +852,13 @@ def live_header(day, symbols, trades, context, settings):
     c[4].metric("Open now", len(live_trades))
 
     clock = session_clock(settings, now)
+    if is_trendbreakout(settings):
+        plan = ("Trend Breakout %dm · 1H EMA %d/%d · fills %s–%s · stop %g ATR · target %gR · square-off %s"
+                % (settings.tfMinutes, settings.fastLen, settings.slowLen,
+                   settings.entryFrom, settings.entryTo, settings.slAtr, settings.tpR,
+                   settings.sqOffTime))
+        st.caption("%s  ·  refreshed %s IST" % (plan, now.strftime("%H:%M:%S")))
+        return phase
     if is_supertrend(settings):
         plan = ("Supertrend %dm (%g, %d) · entries %s–%s · square-off %s · exit %s"
                 % (settings.tfMinutes, settings.factor, settings.atrPeriod,
@@ -876,6 +941,11 @@ def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=Tru
                 "%": st.column_config.NumberColumn(format="%+.2f%%"),
                 "To stop %": st.column_config.NumberColumn(format="%.2f%%"),
             })
+    elif is_trendbreakout(settings):
+        if phase == "waiting":
+            st.caption("Fills open at %s." % settings.entryFrom)
+        elif phase == "armed":
+            st.caption("Fills are live; no breakout in the trend direction yet.")
     elif is_supertrend(settings):
         if phase == "waiting":
             st.caption("Entries open at %s." % settings.entryFrom)
@@ -987,7 +1057,13 @@ def render_results(trades, context, missing, day, ui, details,
 
             m = st.columns(4)
             m[0].metric("Day move", "%+.2f%%" % ctx["day_pct"])
-            if "st_line" in ctx:
+            if ctx.get("tb"):
+                m[1].metric("1H trend at last bar", ctx["trend"])
+                nxt = ctx["next_buy"] if ctx["trend"] == "UP" else ctx["next_sell"]
+                m[2].metric("Next trigger", "close %s %.2f" % (">" if ctx["trend"] == "UP" else "<", nxt)
+                            if nxt == nxt else "—")
+                m[3].metric("Signals today", sum(1 for t in trades if t.symbol == pick))
+            elif "st_line" in ctx:
                 m[1].metric("Trend at last bar", ctx["trend"])
                 m[2].metric("Supertrend", "%.2f" % ctx["st_last"])
                 m[3].metric("Signals today", sum(1 for t in trades if t.symbol == pick))
@@ -1014,6 +1090,16 @@ def render_results(trades, context, missing, day, ui, details,
             rows = []
             for s in quiet:
                 ctx = context[s]
+                if ctx.get("tb"):
+                    rows.append({
+                        "Symbol": s,
+                        "Day %": round(ctx["day_pct"], 2),
+                        "1H trend": ctx["trend"],
+                        "EMA 50": round(ctx["ema_fast"], 2) if ctx["ema_fast"] == ctx["ema_fast"] else None,
+                        "EMA 200": round(ctx["ema_slow"], 2) if ctx["ema_slow"] == ctx["ema_slow"] else None,
+                        "Waiting for pullback": "yes" if ctx["waiting"] else "",
+                    })
+                    continue
                 if "st_line" in ctx:
                     rows.append({
                         "Symbol": s,
@@ -1035,7 +1121,12 @@ def render_results(trades, context, missing, day, ui, details,
                 })
             st.dataframe(pd.DataFrame(rows).sort_values("Day %", ascending=False),
                          use_container_width=True, hide_index=True)
-            if is_supertrend(settings):
+            if is_trendbreakout(settings):
+                st.caption("No close beyond the 40-candle high/low in the 1H trend "
+                           "direction inside the fill window -- or the trend was "
+                           "unclear (EMA 50 and 200 crossed, or price between them), "
+                           "or a filter or the late-entry guard held it back.")
+            elif is_supertrend(settings):
                 st.caption("No flip inside the entry window — the trend held all "
                            "morning, or it turned only after the cut-off.")
             else:

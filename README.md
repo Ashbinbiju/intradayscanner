@@ -178,6 +178,7 @@ python run.py backtest --symbol SBIN-EQ --days 60 \
 | [orbfvg/broker.py](orbfvg/broker.py) | Events → orders. Sizing, protective stop, journal |
 | [orbfvg/live.py](orbfvg/live.py) | Live loop: warm up, then one bar at a time |
 | [orbfvg/backtest.py](orbfvg/backtest.py) | Historical replay and reporting |
+| [orbfvg/trendbreakout.py](orbfvg/trendbreakout.py) | NSE Trend Breakout engine (1H trend + 40-candle breakout) |
 | [orbfvg/screener.py](orbfvg/screener.py) | intradayscreener.com client, bucket parsing, snapshot history |
 | [orbfvg/upstox.py](orbfvg/upstox.py) | Upstox candles + ISIN instrument keys (data only) |
 | [orbfvg/feed.py](orbfvg/feed.py) | One candle source with the other behind it |
@@ -318,6 +319,65 @@ slot. The 09:30 entries are the worst. Treat it as a tool for studying days,
 not as a proven edge. Candle feeds also differ slightly — a close a paisa
 either side of the line moves a signal by a candle, so individual trades can
 differ from a TradingView chart even though the logic matches.
+
+---
+
+## Fourth strategy: NSE Trend Breakout, intraday
+
+`--strategy trendbreakout` (and **Strategy → Trend Breakout** in the scanner
+sidebar) runs the Pine indicator *"NSE Trend Breakout Intraday v1.1"* with its
+default inputs — itself an NSE intraday version of a gold 1H breakout system:
+
+1. **Trend** — 1-hour EMA 50 vs EMA 200, plus the 1H close beyond the EMA 200,
+   read from the previous **completed** hour (Pine `lookahead_on` with `[1]`,
+   so nothing repaints). Up = buys only, down = sells only, mixed = no trades.
+2. **Signal** — a signal candle (15m by default, or 5m) **closes** above the
+   prior 40 candles' high (BUY) or below their low (SELL).
+3. **Fill** — at the **next** candle's open, which must fall **09:30–13:00**
+   IST. Stop `1.5 × ATR(14)` of the signal candle from the fill, target 3R.
+   One candle spanning stop and target takes the stop.
+4. **Guards** — skip when `ATR14 / ATR100 < 0.8` or the 40-candle range is
+   wider than 10 ATR. A signal more than 4 ATR from the 21-candle swing is
+   *late*: it waits up to 10 candles for a 0.5 ATR pullback and enters on a
+   candle closing back beyond the signal price (`(retest)`). After a stop-out,
+   one re-entry within 10 candles if price closes back through the signal
+   price in the trend direction (`(re)`).
+5. **Exit** — stop, 3R, an opposite signal, or the open of the first candle
+   starting at/after **15:00**. Nothing is carried overnight.
+
+```bash
+python run.py backtest --strategy trendbreakout --symbol ATHERENERG-EQ --days 60
+python run.py backtest --strategy trendbreakout --symbol WIPRO-EQ --set tfMinutes=5 --set entryTo=14:30
+```
+
+**Warm-up.** EMA 200 on hourly candles needs 200 completed hours — about 29
+sessions — before the first trend reading. The backtest therefore replays
+`--warmup-days` (default 45) of history before the window without scoring
+it, and the scanner pulls 60 days per symbol for this strategy, so its first
+scan of a day is slower than the others. Upstox serves minute candles about a
+month per request, so `orbfvg/upstox.py` now fetches long windows in pieces.
+
+`tests/test_trendbreakout.py` checks the engine trade for trade against a
+separate, line-by-line transcription of the Pine script on 5m and 15m, plus
+the session rules, the late guard and same-candle resolution.
+
+### What it measured
+
+In TradingView, on 37 NSE stocks (5m since July 2026, 15m since January 2026),
+net of a 0.05% round trip:
+
+| | 5m trades | 5m net R | 15m trades | 15m net R |
+|---|---|---|---|---|
+| v1.0 (fills to 14:30) | 1,080 | −141 | 1,575 | −107 |
+| **v1.1 (fills to 13:00)** | 810 | **−96** | 1,378 | **−108** |
+| v1.0 **before** costs | 1,080 | −7 | 1,575 | 0 |
+
+The entries carry no edge before costs, and a 1.5 ATR stop is small enough
+that the costs take 0.07–0.13R a trade — the same trap the breakdown strategy
+falls into. None of six filters tried (no re-entry, one trade a day, entries
+from 10:00, the 13:00 cut-off, VWAP side, breakeven at 1R) made it positive
+on both timeframes. It is here to study days and test ideas against, not as
+a proven edge.
 
 ---
 
@@ -560,6 +620,7 @@ slippage — roughly 0.08% round trip) eat about half the edge.
 ```bash
 python tests/test_strategy.py    # engine rules vs. the Pine source
 python tests/test_broker.py      # sizing, payloads, caps, journal — offline
+python tests/test_trendbreakout.py   # trend breakout vs. a direct Pine transcription
 ```
 
 ---

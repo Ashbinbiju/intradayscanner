@@ -176,6 +176,8 @@ def cmd_backtest(args) -> int:
         return cmd_backtest_breakdown(args)
     if getattr(args, "strategy", "orb") == "supertrend":
         return cmd_backtest_supertrend(args)
+    if getattr(args, "strategy", "orb") == "trendbreakout":
+        return cmd_backtest_trendbreakout(args)
     strategy, trade = build_settings(args)
     client = AngelClient()
     client.login()
@@ -259,8 +261,10 @@ def cmd_backtest_supertrend(args) -> int:
 
     _, trade = build_settings(args)
     tz = ZoneInfo(settings.tzIn)
-    end = datetime.strptime(args.date_to, "%Y-%m-%d").replace(tzinfo=tz) + timedelta(days=1)         if args.date_to else datetime.now(tz)
-    start = datetime.strptime(args.date_from, "%Y-%m-%d").replace(tzinfo=tz)         if args.date_from else end - timedelta(days=args.days)
+    end = datetime.strptime(args.date_to, "%Y-%m-%d").replace(tzinfo=tz) + timedelta(days=1) \
+        if args.date_to else datetime.now(tz)
+    start = datetime.strptime(args.date_from, "%Y-%m-%d").replace(tzinfo=tz) \
+        if args.date_from else end - timedelta(days=args.days)
     feed = MarketData()
     inst = feed.instrument(trade.symbol, trade.exchange)
     settings.mintick = inst.tick_size
@@ -283,9 +287,67 @@ def cmd_backtest_supertrend(args) -> int:
         config.LOG_DIR, "supertrend_%s_%s.csv"
         % (inst.symbol, datetime.now().strftime("%Y%m%d_%H%M%S")))
     bt.export_trades(result, out)
-    print("
-  Trades written to %s
-" % out)
+    print("\n  Trades written to %s\n" % out)
+    return 0
+
+
+def cmd_backtest_trendbreakout(args) -> int:
+    """NSE Trend Breakout intraday (the Pine v1.1 indicator)."""
+    from orbfvg.trendbreakout import TrendBreakoutStrategy
+
+    settings = config.TrendBreakoutSettings()
+    for pair in getattr(args, "set", None) or []:
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if not hasattr(settings, key):
+            raise SystemExit("Unknown setting %r. Valid names: %s"
+                             % (key, ", ".join(sorted(vars(settings)))))
+        setattr(settings, key, coerce(getattr(settings, key), value))
+    settings.validate()
+
+    _, trade = build_settings(args)
+    tz = ZoneInfo(settings.tzIn)
+    end = datetime.strptime(args.date_to, "%Y-%m-%d").replace(tzinfo=tz) + timedelta(days=1) \
+        if args.date_to else datetime.now(tz)
+    start = datetime.strptime(args.date_from, "%Y-%m-%d").replace(tzinfo=tz) \
+        if args.date_from else end - timedelta(days=args.days)
+    # The 1H EMA 200 needs ~29 sessions of hourly candles before it reads a
+    # trend, so history ahead of the window is fetched and replayed but not scored.
+    warm_start = start - timedelta(days=args.warmup_days)
+    feed = MarketData()
+    inst = feed.instrument(trade.symbol, trade.exchange)
+    settings.mintick = inst.tick_size
+    bars = feed.candles(trade.exchange, trade.symbol, trade.interval, warm_start, end, tz=tz)
+    if not bars:
+        print("No candles returned for that window.")
+        return 1
+    print("  candles via %s (%d bars, %d-day warm-up)"
+          % (feed.last_source, len(bars), args.warmup_days))
+
+    result = bt.run(bars, settings, engine=TrendBreakoutStrategy)
+    result.trades = [t for t in result.trades if t.entry_time >= start]
+    result.events = [e for e in result.events if e.time >= start]
+    scored = [b for b in bars if b.time >= start]
+    result.bars = len(scored)
+    if scored:
+        result.start, result.end = scored[0].time, scored[-1].time
+    print("")
+    print(bt.format_simple_report(
+        result, inst.symbol, "NSE Trend Breakout (%dm)" % settings.tfMinutes,
+        ["Trend        %dm EMA %d / %d (previous completed candle)"
+         % (settings.htfMinutes, settings.fastLen, settings.slowLen),
+         "Signal       close beyond prior %d candles   Stop %g x ATR(%d)   Target %gR"
+         % (settings.brkLen, settings.slAtr, settings.atrLen, settings.tpR),
+         "Guards       re-entry %s   late-entry pullback %s   ATR ratio >= %g   range < %g ATR"
+         % ("on" if settings.useRe else "off", "on" if settings.useLate else "off",
+            settings.minVol, settings.maxRng),
+         "Session      fills %s-%s   Square off %s"
+         % (settings.entryFrom, settings.entryTo, settings.sqOffTime)]))
+    out = args.out or os.path.join(
+        config.LOG_DIR, "trendbreakout_%s_%s.csv"
+        % (inst.symbol, datetime.now().strftime("%Y%m%d_%H%M%S")))
+    bt.export_trades(result, out)
+    print("\n  Trades written to %s\n" % out)
     return 0
 
 
@@ -361,10 +423,15 @@ def main() -> int:
 
     p = sub.add_parser("backtest", help="replay historical candles")
     common(p)
-    p.add_argument("--strategy", choices=["orb", "breakdown", "supertrend"], default="orb",
+    p.add_argument("--strategy", choices=["orb", "breakdown", "supertrend", "trendbreakout"],
+                   default="orb",
                    help="orb = the ported indicator; breakdown = "
                         "trend/consolidation/breakdown/retest short; supertrend = "
-                        "15m Supertrend flip with SL/TP1-TP3, intraday")
+                        "15m Supertrend flip with SL/TP1-TP3, intraday; trendbreakout = "
+                        "1H-trend 40-candle breakout, fills 09:30-13:00, flat 15:00")
+    p.add_argument("--warmup-days", type=int, default=45,
+                   help="trendbreakout only: extra calendar days replayed (not scored) "
+                        "so the 1H EMA 200 is warm")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD")

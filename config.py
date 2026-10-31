@@ -389,6 +389,74 @@ class SupertrendSettings:
             raise ValueError("maxTradesPerDay must be >= 0")
 
 
+@dataclass
+class TrendBreakoutSettings:
+    """NSE Trend Breakout, intraday -- the Pine "NSE Trend Breakout Intraday
+    v1.1" indicator with its default inputs.
+
+    1H EMA 50/200 trend, a close beyond the prior 40 candles' high/low, fill at
+    the next candle's open, stop 1.5 x ATR, target 3R, weak-spot filters, a
+    late-entry pullback guard and one re-entry after a stop-out. Fills
+    09:30-13:00 IST, flat at 15:00.
+    """
+
+    # -- Session (IST) -------------------------------------------------------
+    tzIn: str = "Asia/Kolkata"
+    tfMinutes: int = 15                 # signal candles, built from the feed (5 = the feed)
+    barMinutes: int = 5                 # what the feed delivers
+    sessionStart: str = "09:15"         # candles and the 1H trend align to this
+    entryFrom: str = "09:30"            # earliest FILL time (next candle's open)
+    entryTo: str = "13:00"              # latest fill time (v1.1; v1.0 used 14:30)
+    sqOffTime: str = "15:00"            # exit at the open of the first candle at/after this
+
+    # -- Trend (1H) ----------------------------------------------------------
+    htfMinutes: int = 60
+    fastLen: int = 50
+    slowLen: int = 200
+
+    # -- Signal, stop and target ----------------------------------------------
+    brkLen: int = 40                    # breakout of the prior N candles
+    atrLen: int = 14
+    slAtr: float = 1.5
+    tpR: float = 3.0
+    allowL: bool = True
+    allowS: bool = True
+
+    # -- Weak-spot filters ------------------------------------------------------
+    atrSlowLen: int = 100
+    minVol: float = 0.8                 # skip when ATR14 / ATR100 is below this
+    maxRng: float = 10.0                # skip when the N-candle range is wider than this x ATR
+
+    # -- Re-entry after a stop-out ---------------------------------------------
+    useRe: bool = True
+    reBars: int = 10
+
+    # -- Late-entry guard -----------------------------------------------------
+    useLate: bool = True
+    swingLen: int = 20                  # swing = highest/lowest of the last swingLen+1 candles
+    lateAtr: float = 4.0
+    pbAtr: float = 0.5
+    pbBars: int = 10
+
+    mintick: float = 0.05
+
+    def validate(self) -> None:
+        if self.tfMinutes < self.barMinutes or self.tfMinutes % self.barMinutes:
+            raise ValueError("tfMinutes must be a multiple of barMinutes")
+        if self.htfMinutes % self.barMinutes:
+            raise ValueError("htfMinutes must be a multiple of barMinutes")
+        for name in ("sessionStart", "entryFrom", "entryTo", "sqOffTime"):
+            hh, _, mm = getattr(self, name).partition(":")
+            if not (hh.isdigit() and mm.isdigit()):
+                raise ValueError("%s must be HH:MM" % name)
+        if self.entryFrom > self.entryTo:
+            raise ValueError("entryFrom must not be after entryTo")
+        if min(self.fastLen, self.slowLen, self.brkLen, self.atrLen, self.atrSlowLen) < 1:
+            raise ValueError("lengths must be >= 1")
+        if self.slAtr <= 0 or self.tpR <= 0:
+            raise ValueError("slAtr and tpR must be > 0")
+
+
 # ===========================================================================
 #  Instrument + execution
 # ===========================================================================
