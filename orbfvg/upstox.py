@@ -177,10 +177,16 @@ class UpstoxClient:
 
         rows: List[list] = []
         hist_end = min(end.date(), today - timedelta(days=1))
-        if start.date() <= hist_end:
+        # Minute candles are served about a month per request, so a longer
+        # window (the trend-breakout warm-up wants ~60 days) is fetched in pieces.
+        chunk = timedelta(days=28) if unit == "minutes" else timedelta(days=3650)
+        piece_start = start.date()
+        while piece_start <= hist_end:
+            piece_end = min(piece_start + chunk, hist_end)
             url = "%s/v3/historical-candle/%s/%s/%s/%s/%s" % (
-                API, key, unit, step, hist_end.isoformat(), start.date().isoformat())
+                API, key, unit, step, piece_end.isoformat(), piece_start.isoformat())
             rows.extend(self._get(url).get("candles") or [])
+            piece_start = piece_end + timedelta(days=1)
 
         if end.date() >= today >= start.date():
             url = "%s/v3/historical-candle/intraday/%s/%s/%s" % (API, key, unit, step)
