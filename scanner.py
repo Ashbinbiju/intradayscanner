@@ -42,6 +42,7 @@ for _key in ("CLIENT_ID", "PASSWORD", "TOTP_SECRET", "API_KEY",
 
 import config
 from orbfvg import backtest as bt
+from orbfvg import livestate as LS
 from orbfvg import screener
 from orbfvg import universe as U
 from orbfvg.strategy import Bar
@@ -54,6 +55,17 @@ LONDON = ZoneInfo("Europe/London")
 st.set_page_config(page_title="Intraday Scanner", page_icon="📈", layout="wide")
 
 STRATEGIES = ["ORB + FVG", "Supertrend", "Trend Breakout"]
+
+# Starting list selection per Direction. "Both" takes the mirror image of the
+# bullish set, so short setups come from bearish lists, not only from stocks
+# that happened to sit on a bullish one.
+DEFAULT_LISTS = {
+    "Bullish": ("stocksNearDaysHighAnd3DayHigh", "stocksNearDaysHighAndYestHigh",
+                "high52Week", "volumeGainers"),
+    "Bearish": ("stocksNearDaysHighAnd3DayLow", "stocksNearDaysLowAndYestLow",
+                "low52Week", "topLoosers"),
+}
+DEFAULT_LISTS["Both"] = DEFAULT_LISTS["Bullish"] + DEFAULT_LISTS["Bearish"]
 
 
 def is_supertrend(settings):
@@ -242,13 +254,37 @@ def seconds_to_next_bar(now=None):
     return max(0, int((nxt - now).total_seconds()))
 
 
-@st.cache_data(show_spinner=False, ttl=900)
 def fetch_candles(symbol, exchange, day_from, day_to, bucket="", prefer="upstox"):
-    """Cache first, Angel second. Returns (rows, meta) or (None, None).
+    """Cache first, then the feed. Returns (rows, meta) or (None, None).
 
-    `bucket` is unused in the body -- it exists so a new 5-minute slot is a
-    cache miss and forces a re-fetch.
+    Live mode used to re-pull the whole 60-day warm-up for every symbol at
+    every 5-minute close -- minutes of requests per refresh at 90 symbols,
+    which is what made a sidebar change or a reconnect hang. History up to
+    yesterday cannot change during the day, so it is cached for hours and
+    only today's bars are re-pulled per `bucket`.
     """
+    if not bucket or day_from >= day_to:
+        return _fetch_range(symbol, exchange, day_from, day_to, bucket, prefer)
+    yesterday = (datetime.strptime(day_to, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    hist_rows, hist_meta = _fetch_history(symbol, exchange, day_from, yesterday, prefer)
+    today_rows, today_meta = _fetch_range(symbol, exchange, day_to, day_to, bucket, prefer)
+    if not today_rows:
+        # Nothing for today yet (or the split pull failed): fall back to one pull.
+        return _fetch_range(symbol, exchange, day_from, day_to, bucket, prefer)
+    rows = [r for r in (hist_rows or []) if r[0][:10] < day_to] + list(today_rows)
+    return rows, (today_meta or hist_meta)
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def _fetch_history(symbol, exchange, day_from, day_to, prefer="upstox"):
+    """Completed sessions only -- safe to keep for hours."""
+    return _fetch_range(symbol, exchange, day_from, day_to, "history", prefer)
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _fetch_range(symbol, exchange, day_from, day_to, bucket="", prefer="upstox"):
+    """`bucket` is unused in the body -- it exists so a new 5-minute slot is a
+    cache miss and forces a re-fetch."""
     store = load_cache_file()
     if symbol in store["candles"]:
         rows = store["candles"][symbol]
@@ -415,9 +451,17 @@ def scan(symbols, target_day, ui, exchange="NSE", bucket="", quiet=False,
         for t in result.trades:
             if t.entry_time.strftime("%Y-%m-%d") == target_day:
                 t.symbol = symbol
+                # Trend Breakout fills (and squares off) AT a bar's open.
+                t.at_open = trendbreakout
                 trades.append(t)
     if progress is not None:
         progress.empty()
+    # The engine squares off on the first bar at/after the cut-off. If the
+    # feed had not delivered that bar by the last refresh, the trade would
+    # stay "open" for good (the page stops refreshing once the day is done).
+    if is_trendbreakout(settings) and getattr(settings, "sqOffTime", ""):
+        LS.settle_open_trades(trades, {s: c["bars"] for s, c in context.items()},
+                              settings.sqOffTime, IST, datetime.now(IST))
     trades.sort(key=lambda t: (t.entry_time, t.symbol))
     return trades, context, missing
 
@@ -441,7 +485,9 @@ def apply_caps(trades, max_per_day, max_concurrent):
             skipped.append((t, "slots busy"))
         else:
             taken.append(t)
-            open_until.append(t.exit_time or t.entry_time)
+            # A trade still open holds its slot until it closes, not just
+            # for the instant it was entered.
+            open_until.append(t.exit_time or t.entry_time + timedelta(days=1))
     return taken, skipped
 
 
@@ -458,8 +504,26 @@ def filled_at(moment):
     Events are stamped with the bar's OPEN, as Pine does, so an entry taken at
     the 09:30 close is stamped 09:25. Showing that to a trader reads as an
     entry before 09:30, so every table shows the bar's close instead.
+
+    Not for Trend Breakout fills and square-offs -- those happen *at* a bar's
+    open; use entry_at / exit_at, which know the difference.
     """
     return (moment + FEED_BAR).strftime("%H:%M")
+
+
+def entry_at(t):
+    return LS.entry_display(t, getattr(t, "at_open", False))
+
+
+def exit_at(t):
+    return LS.exit_display(t, getattr(t, "at_open", False))
+
+
+def event_at(e, at_open):
+    """Trend Breakout entries and square-offs are stamped at the moment they fill."""
+    opens = at_open and (e.type.name == "ENTRY" or
+                         (e.type.name == "SESSION_EXIT" and e.reason == "SESSION_END"))
+    return LS.display_time(e.time, opens)
 
 
 def _fact(details, symbol, field):
@@ -554,12 +618,29 @@ def candle_chart(symbol, ctx, trade, settings):
 # ---------------------------------------------------------------------------
 st.title("Intraday Scanner")
 
+
+# The main choices are mirrored into the page URL. A Streamlit reconnect starts
+# a brand-new session with every widget back on its default -- mid-session that
+# silently switched Live back to "Review a day" and the strategy back to
+# ORB + FVG. The URL survives the reconnect (and can be bookmarked).
+def remembered(key, options, default=0):
+    value = st.query_params.get(key)
+    return options.index(value) if value in options else default
+
+
+def remember(key, value):
+    if st.query_params.get(key) != value:
+        st.query_params[key] = value
+
+
 with st.sidebar:
     st.header("Mode")
+    _modes = ["Review a day", "Live"]
     mode = st.radio(
-        "Mode", ["Review a day", "Live"], index=0, label_visibility="collapsed",
+        "Mode", _modes, index=remembered("mode", _modes), label_visibility="collapsed",
         help="Review replays a chosen day once, on demand. Live re-scans by "
              "itself at every 5-minute close during market hours.")
+    remember("mode", mode)
     live_mode = mode == "Live"
     if live_mode:
         refresh_secs = st.select_slider(
@@ -579,12 +660,15 @@ with st.sidebar:
         lock_universe = True
 
     st.header("Universe")
+    _sources = ["Our screener", "Screener (live)", "Recorded snapshot", "Type a list"]
+    # With no universe built, "Our screener" can only show a warning; start
+    # on the live screener instead.
+    _default_source = 0 if U.load_daily()[0] else 1
     source = st.radio(
-        "Symbols from",
-        ["Our screener", "Screener (live)", "Recorded snapshot", "Type a list"],
-        index=0,
+        "Symbols from", _sources, index=remembered("source", _sources, _default_source),
         help="Our screener needs no third-party API -- it ranks the NSE cash "
              "list from candles we already pull.")
+    remember("source", source)
 
     symbols, details = [], {}
     spec = {"source": "typed", "symbols": []}
@@ -628,24 +712,36 @@ with st.sidebar:
                     "**Type a list** to carry on without it.")
             data = {}
         if data:
-            side = st.radio("Direction", ["Bullish", "Bearish", "Both"],
-                            index=0, horizontal=True)
+            _sides = ["Bullish", "Bearish", "Both"]
+            side = st.radio("Direction", _sides, index=remembered("side", _sides),
+                            horizontal=True)
+            remember("side", side)
             pool = (screener.BULLISH if side == "Bullish" else
                     screener.BEARISH if side == "Bearish" else
                     screener.BULLISH + screener.BEARISH)
             available_buckets = [b for b in pool if screener.symbols_in(data, b)]
-            default = [b for b in ("stocksNearDaysHighAnd3DayHigh",
-                                   "stocksNearDaysHighAndYestHigh",
-                                   "high52Week", "volumeGainers")
-                       if b in available_buckets] or available_buckets[:2]
+            default = [b for b in DEFAULT_LISTS[side] if b in available_buckets] \
+                or available_buckets[:2]
+            # Keyed per direction: switching Bullish -> Both now picks up the
+            # bearish defaults instead of keeping the bullish-only selection.
             chosen = st.multiselect(
-                "Lists", available_buckets, default=default,
+                "Lists", available_buckets, default=default, key="lists_" + side,
                 format_func=lambda b: "%s (%d)" % (
                     screener.LABELS.get(b, b), len(screener.symbols_in(data, b))))
             min_chg = st.slider("Min |price change| %", 0.0, 15.0, 0.0, 0.5)
             spec = {"source": "live", "buckets": chosen, "min_chg": min_chg}
             symbols, details = resolve_universe(spec)
-            st.caption("%d symbols selected" % len(symbols))
+            st.caption("%d symbols on the lists right now" % len(symbols))
+            if live_mode:
+                _lock = LS.UniverseLock(config.DATA_DIR,
+                                        datetime.now(IST).strftime("%Y-%m-%d"), spec)
+                _saved = _lock.load()
+                if _saved:
+                    st.caption("Today's watchlist is **locked at %d symbols** (since %s). "
+                               "The lists keep changing, but the scan stays on the "
+                               "locked set until tomorrow. Changing Direction or "
+                               "Lists starts a new watchlist from the current lists."
+                               % (len(_saved["symbols"]), _saved.get("locked_at", "")[11:16]))
             st.caption("Live snapshot — it reflects **now**, so use it with "
                        "today's date. Each pull is saved for later replay.")
 
@@ -681,6 +777,9 @@ with st.sidebar:
             "One per line or comma separated",
             "NEWGEN\nATHERENERG\nTEJASNET\nCOFORGE\nSHYAMMETL\nCGCL")
         symbols = [s.strip().upper() for s in typed.replace(",", "\n").split("\n") if s.strip()]
+        # Live mode re-resolves the universe from `spec` on every tick; without
+        # this it resolved to the empty default and scanned nothing.
+        spec = {"source": "typed", "symbols": symbols}
 
     st.header("Date")
     if live_mode:
@@ -696,12 +795,13 @@ with st.sidebar:
     st.header("Strategy")
     ui = {}
     ui["strategy"] = st.selectbox(
-        "Strategy", STRATEGIES, index=0,
+        "Strategy", STRATEGIES, index=remembered("strategy", STRATEGIES),
         help="ORB + FVG: opening-range breakout confirmed by a fair-value gap. "
              "Supertrend: the 'Supertrend with Entry, TP1, TP2 & TP3' "
              "indicator's flip signal, traded intraday. "
              "Trend Breakout: 1H EMA 50/200 trend + close beyond the prior "
              "40 candles (the NSE Trend Breakout v1.1 indicator).")
+    remember("strategy", ui["strategy"])
 
     if ui["strategy"] == "Trend Breakout":
         ui["tb_tfMinutes"] = st.select_slider(
@@ -791,7 +891,12 @@ with st.sidebar:
 #  Live panels
 # ---------------------------------------------------------------------------
 def open_positions(trades, context):
-    """Signals with no exit yet, marked to the latest bar close."""
+    """Trades with no exit yet, marked to the latest bar close.
+
+    Pass only the trades you want listed -- the live view passes the taken
+    ones here and shows cap-skipped signals separately, so "Open positions"
+    means positions you could actually be holding.
+    """
     rows = []
     for t in trades:
         if t.exit == t.exit:          # already closed
@@ -801,30 +906,38 @@ def open_positions(trades, context):
             continue
         last = bars[-1].close
         direction = 1 if t.side == "BUY" else -1
-        risk = abs(t.entry - t.stop)
+        r_now = LS.open_r(t, last)
+        reached = LS.reached_targets(t, bars)
         rows.append({
             "Symbol": t.symbol,
             "Side": t.side,
-            "In at": filled_at(t.entry_time),
+            "In at": entry_at(t),
             "Entry": round(t.entry, 2),
             "Now": round(last, 2),
-            "Open R": round((last - t.entry) * direction / risk, 2) if risk else None,
+            "Open R": round(r_now, 2) if r_now is not None else None,
             "%": round((last - t.entry) * direction / t.entry * 100, 2),
             "Stop": round(t.stop, 2),
             "To stop %": round(abs(last - t.stop) / last * 100, 2),
             "T1": round(t.t1, 2),
             "T2": round(t.t2, 2),
             "T3": round(t.t3, 2),
-            "Next target": ("T1" if not _reached(t, 1) else
-                            "T2" if not _reached(t, 2) else
-                            "T3" if not _reached(t, 3) else "—"),
+            "Next target": ("T1" if reached < 1 else "T2" if reached < 2 else
+                            "T3" if reached < 3 else "—"),
         })
     return rows
 
 
-def _reached(trade, n):
-    """Has target n already been tagged on this trade?"""
-    return getattr(trade, "targets_hit", 0) >= n
+def open_r_total(trades, context):
+    """Sum of open R across still-open trades, marked to the last close."""
+    total = 0.0
+    for t in trades:
+        if t.exit == t.exit:
+            continue
+        bars = (context.get(t.symbol) or {}).get("bars") or []
+        if bars:
+            r = LS.open_r(t, bars[-1].close)
+            total += r or 0.0
+    return total
 
 
 def _hms(seconds):
@@ -835,12 +948,14 @@ def _hms(seconds):
     return "%dh %02dm" % (h, m) if h else "%dm %02ds" % (m, s)
 
 
-def live_header(day, symbols, trades, context, settings):
+def live_header(day, symbols, trades, context, settings, taken=None):
     now = datetime.now(IST)
     phase, label, nxt, secs = strategy_phase(settings, now)
     icon = {"waiting": "🟡", "range": "🟠", "armed": "🟢", "managing": "🔵",
             "done": "⚪", "closed": "🔴"}[phase]
-    live_trades = [t for t in trades if t.exit != t.exit]
+    # "Open now" counts positions you could hold: taken trades, not every
+    # signal the cap skipped.
+    live_trades = [t for t in (trades if taken is None else taken) if t.exit != t.exit]
 
     c = st.columns(5)
     c[0].metric("Strategy", "%s %s" % (icon, label), nxt)
@@ -877,6 +992,18 @@ def live_header(day, symbols, trades, context, settings):
     return phase
 
 
+def lock_state(lock):
+    """Today's locked watchlist: this session's copy, else the one on disk."""
+    mine = st.session_state.get("locked_universe")
+    if (isinstance(mine, dict) and mine.get("day") == lock.day
+            and st.session_state.get("locked_key") == lock.key):
+        return mine
+    saved = lock.load()
+    st.session_state["locked_universe"] = saved
+    st.session_state["locked_key"] = lock.key
+    return saved
+
+
 def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=True,
                 prefer="upstox"):
     """One live pass: re-resolve the universe, rescan, draw everything."""
@@ -891,22 +1018,38 @@ def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=Tru
     # list at 14:00 still have a valid 12:30 range, but letting the universe
     # grow all afternoon inflates the scan (one candle request per symbol per
     # bar, at 3/sec) and drifts away from how the strategy was tested.
-    locked = st.session_state.get("locked_universe")
-    if lock_after_range and phase_key in ("armed", "managing", "done"):
+    #
+    # The lock is saved to disk per day and universe definition, not only in
+    # the browser session: a reconnect used to rebuild it from whatever the
+    # screener listed at that moment and replay the whole morning on a
+    # different set of stocks.
+    lock = LS.UniverseLock(config.DATA_DIR, day, spec)
+    locked = lock_state(lock)
+    if lock_after_range and phase_key in ("armed", "managing", "done", "closed"):
         if locked:
-            symbols = locked
-        else:
-            st.session_state["locked_universe"] = symbols
+            symbols = locked["symbols"]
+            # Screener facts as of the lock, so a symbol that has since left
+            # every list still shows its Day % / Vol %.
+            details = {**(locked.get("details") or {}), **(details or {})}
+        elif phase_key != "closed" and symbols:
+            locked = lock.save(symbols, details, datetime.now(IST))
+            st.session_state["locked_universe"] = locked
     elif phase_key in ("waiting", "range"):
         st.session_state.pop("locked_universe", None)
+        lock.clear()
 
     previous = st.session_state.get("last_universe")
     st.session_state["last_universe"] = list(symbols)
 
-    bucket = bar_bucket()
-    trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=True,
+    # Show a progress bar when the symbol set is new to this session (first
+    # load, a reconnect, a sidebar change): that pull is the slow one, and a
+    # blank page for minutes reads as a hang. Routine ticks stay quiet.
+    cold = previous is None or set(previous) != set(symbols)
+    bucket = bar_bucket() if phase_key not in ("done", "closed") else day + " final"
+    trades, context, missing = scan(symbols, day, ui, bucket=bucket, quiet=not cold,
                                     prefer=prefer)
-    phase = live_header(day, symbols, trades, context, settings)
+    taken, _skipped = apply_caps(trades, max_per_day, max_concurrent)
+    phase = live_header(day, symbols, trades, context, settings, taken=taken)
 
     if previous is not None and set(previous) != set(symbols):
         added = sorted(set(symbols) - set(previous))
@@ -931,16 +1074,25 @@ def render_live(spec, day, ui, max_per_day, max_concurrent, lock_after_range=Tru
                 st.toast("%s %s @ %.2f" % (t.side, t.symbol, t.entry), icon="🔔")
     st.session_state["seen_signals"] = keys
 
-    live_rows = open_positions(trades, context)
+    open_taken, open_skipped = LS.split_open(trades, taken)
+    live_rows = open_positions(open_taken, context)
+    pos_cols = {
+        "Open R": st.column_config.NumberColumn(format="%+.2f"),
+        "%": st.column_config.NumberColumn(format="%+.2f%%"),
+        "To stop %": st.column_config.NumberColumn(format="%.2f%%"),
+    }
     st.subheader("Open positions" if live_rows else "No open positions")
     if live_rows:
-        st.dataframe(
-            pd.DataFrame(live_rows), use_container_width=True, hide_index=True,
-            column_config={
-                "Open R": st.column_config.NumberColumn(format="%+.2f"),
-                "%": st.column_config.NumberColumn(format="%+.2f%%"),
-                "To stop %": st.column_config.NumberColumn(format="%.2f%%"),
-            })
+        st.dataframe(pd.DataFrame(live_rows), use_container_width=True,
+                     hide_index=True, column_config=pos_cols)
+    if open_skipped:
+        skipped_rows = open_positions(open_skipped, context)
+        with st.expander("%d skipped signal(s) still running — not counted as positions"
+                         % len(skipped_rows)):
+            st.dataframe(pd.DataFrame(skipped_rows), use_container_width=True,
+                         hide_index=True, column_config=pos_cols)
+    if live_rows or open_skipped:
+        pass  # the tables above say it all
     elif is_trendbreakout(settings):
         if phase == "waiting":
             st.caption("Fills open at %s." % settings.entryFrom)
@@ -978,13 +1130,29 @@ def render_results(trades, context, missing, day, ui, details,
     # -- headline ---------------------------------------------------------------
     st.subheader("%s — %d signals across %d symbols" % (day, len(trades), len(context)))
 
+    # R counts closed trades only; anything still open is shown underneath as
+    # "+x.xx open" (marked to the last close) so the headline is never a
+    # silent 0.00 while positions are running.
+    def open_note(group):
+        if not any(t.exit != t.exit for t in group):
+            return None
+        return "%+.2fR open" % open_r_total(group, context)
+
+    taken_closed = [t for t in taken if t.exit == t.exit]
     c = st.columns(5)
     c[0].metric("Signals", len(trades))
     c[1].metric("Taken (cap %d)" % max_per_day, len(taken))
-    c[2].metric("R, taken", "%+.2f" % sum(t.r_multiple for t in taken if t.r_multiple == t.r_multiple))
-    c[3].metric("R, all signals", "%+.2f" % sum(t.r_multiple for t in closed))
-    wins = sum(1 for t in taken if t.r_multiple > 0.01)
-    c[4].metric("Win rate, taken", "%d/%d" % (wins, len(taken)) if taken else "—")
+    c[2].metric("R, taken (closed)",
+                "%+.2f" % sum(t.r_multiple for t in taken_closed if t.r_multiple == t.r_multiple),
+                open_note(taken), delta_color="off")
+    c[3].metric("R, all signals (closed)",
+                "%+.2f" % sum(t.r_multiple for t in closed if t.r_multiple == t.r_multiple),
+                open_note(trades), delta_color="off")
+    wins = sum(1 for t in taken_closed if t.r_multiple > 0.01)
+    c[4].metric("Win rate, taken",
+                "%d/%d" % (wins, len(taken_closed)) if taken_closed else "—",
+                ("%d still open" % (len(taken) - len(taken_closed)))
+                if len(taken) > len(taken_closed) else None, delta_color="off")
 
     if len(trades) > len(taken):
         st.caption(
@@ -1006,7 +1174,7 @@ def render_results(trades, context, missing, day, ui, details,
                 rows.append({
                     "#": n,
                     "Take": "✅" if id(t) in taken_ids else "—",
-                    "Time": filled_at(t.entry_time),
+                    "Time": entry_at(t),
                     "Symbol": t.symbol,
                     "Side": t.side,
                     "Entry": round(t.entry, 2),
@@ -1015,8 +1183,9 @@ def render_results(trades, context, missing, day, ui, details,
                     "T2": round(t.t2, 2),
                     "T3": round(t.t3, 2),
                     "Exit": round(t.exit, 2) if t.exit == t.exit else None,
-                    "Out": filled_at(t.exit_time) if t.exit_time else "open",
-                    "Reason": t.reason,
+                    "Out": exit_at(t),
+                    "Reason": {"SESSION_END": "SQUARE-OFF",
+                               "SESSION_END_EST": "SQUARE-OFF (last price)"}.get(t.reason, t.reason),
                     "R": round(t.r_multiple, 2) if t.r_multiple == t.r_multiple else None,
                     "%": round(pct_of(t), 2) if t.exit == t.exit else None,
                     "Day %": _fact(details, t.symbol, "priceChangePct"),
@@ -1038,9 +1207,16 @@ def render_results(trades, context, missing, day, ui, details,
             if skipped:
                 with st.expander("%d signal(s) skipped by the cap" % len(skipped)):
                     for t, why in skipped:
-                        st.write("%s **%s** %s — %s  (would have been %+.2fR)"
-                                 % (filled_at(t.entry_time), t.symbol, t.side,
-                                    why, t.r_multiple))
+                        r = t.r_multiple
+                        if r == r:
+                            outcome = "would have been %+.2fR" % r
+                        else:
+                            bars = (context.get(t.symbol) or {}).get("bars") or []
+                            r_now = LS.open_r(t, bars[-1].close) if bars else None
+                            outcome = ("still open, %+.2fR so far" % r_now
+                                       if r_now is not None else "still open")
+                        st.write("%s **%s** %s — %s  (%s)"
+                                 % (entry_at(t), t.symbol, t.side, why, outcome))
 
     # -- chart ------------------------------------------------------------------
     with tab_chart:
@@ -1079,7 +1255,8 @@ def render_results(trades, context, missing, day, ui, details,
             if ctx["events"]:
                 st.caption("Engine events")
                 for e in ctx["events"]:
-                    st.text("%s  %-13s %s" % (filled_at(e.time), e.type.value, e.message))
+                    st.text("%s  %-13s %s" % (event_at(e, bool(ctx.get("tb"))),
+                                              e.type.value, e.message))
 
     # -- no-trades --------------------------------------------------------------
     with tab_none:
@@ -1150,10 +1327,18 @@ if live_mode:
 
     _settings = build_settings(ui)
     _phase, _, _next, _ = strategy_phase(_settings)
-    if _phase in ("closed", "done") and not run:
-        live_header(day, symbols, [], {}, _settings)
+    if _phase in ("closed", "done"):
+        # After square-off (or after the close on a trading day) keep showing
+        # the day's final result instead of a blank "0 signals" screen. One
+        # pass, no timer: candles are cached under a fixed "final" key.
+        if _phase == "closed" and datetime.now(IST).weekday() >= 5:
+            live_header(day, symbols, [], {}, _settings)
+            st.info("Market closed (%s). Switch to **Review a day** to replay a "
+                    "past session." % _next)
+            st.stop()
         st.info("Nothing more will happen today (%s). Auto-refresh is paused — "
-                "press **Scan now** to review today's bars anyway." % _next)
+                "this is the day's final result." % _next)
+        render_live(spec, day, ui, max_per_day, max_concurrent, lock_universe, prefer)
         st.stop()
 
     # Only this fragment reruns on the timer, so the sidebar stays responsive

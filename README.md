@@ -93,6 +93,27 @@ toast so nothing is missed while you are looking elsewhere.
 
 Candles are cached per 5-minute bucket, so refreshing more often than once a
 bar costs nothing: only the first refresh after a bar closes re-pulls data.
+The warm-up history (up to yesterday) is cached for hours, so each new bar
+re-pulls only today's candles.
+
+Live-mode details worth knowing:
+
+* **Open positions** lists only trades inside your cap. Signals the cap
+  skipped that are still running sit in a collapsed list below it, and
+  **Open now** counts positions, not signals.
+* The watchlist locked when fills open is **saved per day** (in `data/`), so a
+  reconnect or a page reload keeps scanning the same stocks instead of
+  rebuilding the morning from whatever the screener lists at that moment.
+  Mode, source, direction and strategy are kept in the page URL for the same
+  reason. Changing Direction or Lists mid-session starts a new watchlist.
+* After square-off the page keeps the day's final result. If the feed had not
+  delivered the square-off bar by the last refresh, any trade still open is
+  closed at the last price and marked **SQUARE-OFF (last price)**.
+* Trend Breakout fills and square-offs happen at a bar's *open*, so they show
+  that time (a 12:45 signal candle fills at **13:00**, square-off at
+  **15:00**). Stops and targets fire inside a bar and show the bar's close.
+* "R, taken (closed)" counts closed trades; anything still open shows
+  underneath as "+x.xxR open", marked to the last close.
 
 Three tabs: **Signals** (every entry in the order it fired, with entry / SL /
 T1-T3 / exit / R, and a ✅ on the ones that fit inside your daily cap),
